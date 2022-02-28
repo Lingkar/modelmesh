@@ -15,6 +15,7 @@
 FROM registry.access.redhat.com/ubi8/ubi-minimal:8.4 as build_base
 
 ARG ETCD_VERSION=v3.5.0
+ARG TARGETARCH
 
 LABEL image="build_base"
 
@@ -37,9 +38,9 @@ RUN microdnf install wget tar gzip vim-common python39 && \
 ENV JAVA_HOME=/usr/lib/jvm/java-11-openjdk
 
 # Install etcd -- used for CI tests
-RUN wget -q https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz && \
+RUN wget -q https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-${TARGETARCH}.tar.gz && \
     mkdir -p /usr/lib/etcd && \
-    tar xzf etcd-*-linux-amd64.tar.gz -C /usr/lib/etcd --strip-components=1 && \
+    tar xzf etcd-*-linux-${TARGETARCH}.tar.gz -C /usr/lib/etcd --strip-components=1 && \
     rm -rf etcd*.gz
 
 ENV PATH="/usr/lib/etcd:$PATH"
