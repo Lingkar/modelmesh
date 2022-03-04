@@ -180,13 +180,15 @@ echo "SERVICE_VERSION=${SERVICE_VERSION}"
 
 # Look for version in build-version file first, then SERVICE_VERSION env var
 # If found in either, include in litelinks registration
-VERS_PROP=$(<${MM_INSTALL_PATH}/build-version)
-if [ "$?" = "0" ]; then
-	SVC_VERS="$(echo ${VERS_PROP} | tr -d '\r' | cut -d '=' -f 2- | cut -d ' ' -f 1)"
-	echo "build-version=${SVC_VERS}"
-else
-	SVC_VERS="${SERVICE_VERSION}"
-fi
+#VERS_PROP=$(<${MM_INSTALL_PATH}/build-version)
+
+# TODO:: This has ben commented did not work on RASBIAN, uses the ENV Var
+#if [ "$?" = "0" ]; then
+#	SVC_VERS="$(echo ${VERS_PROP} | tr -d '\r' | cut -d '=' -f 2- | cut -d ' ' -f 1)"
+#	echo "build-version=${SVC_VERS}"
+#else
+SVC_VERS="${SERVICE_VERSION}"
+#fi
 if [ "$SVC_VERS" != "" ]; then
 	SERVICE_ARGS="${SERVICE_ARGS} -v ${SVC_VERS}"
 	echo "Registering ModelMesh Service version as \"${SVC_VERS}\""
