@@ -1148,17 +1148,16 @@ public abstract class ModelMesh extends ThriftService
         for (ServiceInstanceInfo sii : ((LitelinksServiceClient) runtimeClient).getServiceInstanceInfo()) {
             String version = sii.getVersion();
             Matcher m = version == null ? null : VERSION_PATT_OLD.matcher(version);
-//            Version is not working on ARM images.
-//            if (m == null || (m.matches() && MIN_PRIOR_VERSION.compareTo(m.group(1)) > 0)) {
-//                logger.error("Aborting start because another model-mesh instance was found in" + " this cluster ("
-//                        + sdi.getServiceName() + ") with an incompatible version");
-//                logger.error("Existing instance " + sii.getInstanceId() + " has version " + version
-//                        + ". The cluster must first be upgraded to a version between " + MIN_PRIOR_VERSION + " and "
-//                        + FIRST_INCOMPAT_VERSION + " before being upgraded to this one (" + sdi.getServiceVersion()
-//                        + ")");
-//                throw new Exception("Must upgrade cluster to version between " + MIN_PRIOR_VERSION + " and "
-//                        + FIRST_INCOMPAT_VERSION + " before upgrading to this one (" + sdi.getServiceVersion() + ")");
-//            }
+            if (m == null || (m.matches() && MIN_PRIOR_VERSION.compareTo(m.group(1)) > 0)) {
+                logger.error("Aborting start because another model-mesh instance was found in" + " this cluster ("
+                        + sdi.getServiceName() + ") with an incompatible version");
+                logger.error("Existing instance " + sii.getInstanceId() + " has version " + version
+                        + ". The cluster must first be upgraded to a version between " + MIN_PRIOR_VERSION + " and "
+                        + FIRST_INCOMPAT_VERSION + " before being upgraded to this one (" + sdi.getServiceVersion()
+                        + ")");
+                throw new Exception("Must upgrade cluster to version between " + MIN_PRIOR_VERSION + " and "
+                        + FIRST_INCOMPAT_VERSION + " before upgrading to this one (" + sdi.getServiceVersion() + ")");
+            }
 
             if (instanceId.equals(sii.getInstanceId())) {
                 boolean reachable = false;
