@@ -73,4 +73,7 @@ jobs:
         platforms: linux/amd64,linux/arm64
         push: true
         tags: ${{ steps.prep.outputs.tags }}
-        build-args: imageVersion=${{ steps.prep.outputs.version }},buildId=${{ steps.prep.outputs.build_id }},commitSha=${{ steps.prep.outputs.git_commit }}
+        build-args: |
+          imageVersion=${{ steps.prep.outputs.version }}
+          buildId=${{ steps.prep.outputs.build_id }}
+          commitSha=${{ steps.prep.outputs.git_commit }}

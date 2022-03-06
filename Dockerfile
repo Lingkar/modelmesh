@@ -69,6 +69,9 @@ ARG buildId
 ARG commitSha
 ARG USER=2000
 
+RUN echo Check buildId ${buildId}
+
+
 LABEL name="model-mesh" \
       vendor="KServe" \
       version="${imageVersion}" \
@@ -93,8 +96,6 @@ COPY --from=build /build/target/dockerhome/ /opt/kserve/mmesh/
 
 # Make this the current directory when starting the container
 WORKDIR /opt/kserve/mmesh
-
-RUN echo Check buildId ${buildId}
 
 RUN microdnf install shadow-utils python39 && \
     # Create app user

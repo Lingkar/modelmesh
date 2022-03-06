@@ -187,7 +187,11 @@ echo "SERVICE_VERSION=${SERVICE_VERSION}"
 #	SVC_VERS="$(echo ${VERS_PROP} | tr -d '\r' | cut -d '=' -f 2- | cut -d ' ' -f 1)"
 #	echo "build-version=${SVC_VERS}"
 #else
+
+
 SVC_VERS="${SERVICE_VERSION}"
+echo "build-version=${SVC_VERS}"
+
 #fi
 if [ "$SVC_VERS" != "" ]; then
 	SERVICE_ARGS="${SERVICE_ARGS} -v ${SVC_VERS}"
