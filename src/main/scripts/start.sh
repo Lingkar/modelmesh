@@ -328,10 +328,6 @@ fi
 
 echo "MEM_LIMIT_MB=${MEM_LIMIT_MB}"
 
-if [ "$HEAP_SIZE" != "" ]; then
-	echo "** NOTE: HEAP_SIZE env var is deprecated, please remove it"
-fi
-
 if [ "$HEAP_SIZE_MB" = "" ]; then
     # Default heap size to MIN(41% of mem-limit, 640MiB)
     HS=$((${MEM_LIMIT_MB}*41/100))
@@ -340,14 +336,16 @@ if [ "$HEAP_SIZE_MB" = "" ]; then
 fi
 echo "HEAP_SIZE_MB=${HEAP_SIZE_MB}"
 
-# Reserved headroom for JVM internals: 64MiB + 20% of heapsize
-MEM_HEADROOM_MB=$((64+${HEAP_SIZE_MB}/5))
-echo "MEM_HEADROOM_MB=${MEM_HEADROOM_MB}"
-
 MAX_GC_PAUSE=${MAX_GC_PAUSE:-50}
 echo "MAX_GC_PAUSE=${MAX_GC_PAUSE} millisecs"
 
-MAX_DIRECT_BUFS_MB=$((${MEM_LIMIT_MB}-${HEAP_SIZE_MB}-192))
+if [ "$MAX_DIRECT_BUFS_MB" = "" ]; then
+    # Reserved headroom for JVM internals: 64MiB + 8% of heapsize
+    MEM_HEADROOM_MB=$((64+8*${HEAP_SIZE_MB}/100))
+    echo "MEM_HEADROOM_MB=${MEM_HEADROOM_MB}"
+
+    MAX_DIRECT_BUFS_MB=$((${MEM_LIMIT_MB}-${HEAP_SIZE_MB}-${MEM_HEADROOM_MB}))
+fi
 echo "MAX_DIRECT_BUFS_MB=${MAX_DIRECT_BUFS_MB}"
 
 # litelinks kubernetes health probe - defaults to port 8089
@@ -374,11 +372,13 @@ LITELINKS_ARGS="-Dlitelinks.cancel_on_client_close=true -Dlitelinks.threadcontex
 # have litelinks use OpenSSL instead of JDK TLS implementation (faster)
 LL_OPENSSL_ARG="-Dlitelinks.ssl.use_jdk=false"
 
+# These two args are needed to use netty's off-the-books direct buffer allocation
+NETTY_DIRECTBUF_ARGS="-Dio.netty.tryReflectionSetAccessible=true --add-opens=java.base/java.nio=ALL-UNNAMED"
 # this defaults to equal max heap, which can result in container OOMKilled
 MAX_DIRECT_BYTES="$((${MAX_DIRECT_BUFS_MB}*1024*1024))"
 # Java native direct memory setting shouldn't be used since all
-# direct buffers are allocated by netty, so set it small (32MiB)
-JAVA_MAXDIRECT_ARG="-XX:MaxDirectMemorySize=33554432"
+# direct buffers are allocated by netty, so set it small (20MiB)
+JAVA_MAXDIRECT_ARG="-XX:MaxDirectMemorySize=20971520"
 # This defaults to match the java setting so we set it explicitly to desired val
 NETTY_MAXDIRECT_ARG="-Dio.netty.maxDirectMemory=${MAX_DIRECT_BYTES}"
 # Ensure that grpc-java shares a single pooled buffer allocator with other netty usage (e.g. litelinks)
@@ -396,17 +396,23 @@ fi
 # ensure litelinks is first on classpath (should be before libthrift)
 LL_JAR="$(ls lib/litelinks-core-*.jar)"
 
+# disable java FIPS which breaks when TLS is enabled
+if [[ "$CUSTOM_JVM_ARGS" != *-Dcom.redhat.fips=* ]]; then
+  DISABLE_FIPS_ARG="-Dcom.redhat.fips=false"
+fi
+
 # print command that's about to be run
 set -x
 
-exec $JAVA_HOME/bin/java -cp "$LL_JAR:lib/*" -XX:+UnlockExperimentalVMOptions -XX:+UseConcMarkSweepGC \
- -XX:+CMSConcurrentMTEnabled -XX:GCTimeRatio=10 -XX:MaxGCPauseMillis=${MAX_GC_PAUSE} \
+exec $JAVA_HOME/bin/java -cp "$LL_JAR:lib/*" -XX:+UnlockExperimentalVMOptions -XX:+UseG1GC \
+ -XX:MaxGCPauseMillis=${MAX_GC_PAUSE} \
  -XX:-ResizePLAB -Xmx${HEAP_SIZE_MB}m -Xms${HEAP_SIZE_MB}m \
  ${STRING_SCALE_JVM_ARGS} \
  -XX:MaxInlineLevel=28 \
  -Xlog:gc:"${MM_INSTALL_PATH}/log/vgc_${HOSTNAME}.log" ${GC_DIAG_ARGS} \
  -Dfile.encoding=UTF8 \
- -Dio.netty.tryReflectionSetAccessible=true \
+ ${NETTY_DIRECTBUF_ARGS} \
+ ${DISABLE_FIPS_ARG} \
  ${JAVA_MAXDIRECT_ARG} ${NETTY_MAXDIRECT_ARG} ${NETTY_DISABLE_CHECK_ARGS} \
  ${GRPC_USE_SHARED_ALLOC_ARG} \
  ${SSL_PK_ARG} ${TRUSTSTORE_ARG} ${LITELINKS_ARGS} ${CUSTOM_JVM_ARGS} \

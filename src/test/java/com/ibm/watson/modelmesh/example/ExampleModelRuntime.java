@@ -17,22 +17,14 @@
 package com.ibm.watson.modelmesh.example;
 
 import com.google.common.util.concurrent.ThreadFactoryBuilder;
-import com.ibm.watson.modelmesh.api.LoadModelRequest;
-import com.ibm.watson.modelmesh.api.LoadModelResponse;
-import com.ibm.watson.modelmesh.api.ModelSizeRequest;
-import com.ibm.watson.modelmesh.api.ModelSizeResponse;
-import com.ibm.watson.modelmesh.api.RuntimeStatusRequest;
-import com.ibm.watson.modelmesh.api.RuntimeStatusResponse;
+import com.ibm.watson.modelmesh.api.*;
 import com.ibm.watson.modelmesh.api.RuntimeStatusResponse.MethodInfo;
 import com.ibm.watson.modelmesh.api.RuntimeStatusResponse.Status;
-import com.ibm.watson.modelmesh.api.UnloadModelRequest;
-import com.ibm.watson.modelmesh.api.UnloadModelResponse;
 import com.ibm.watson.modelmesh.example.api.ExamplePredictorGrpc.ExamplePredictorImplBase;
 import com.ibm.watson.modelmesh.example.api.Predictor.CategoryAndConfidence;
 import com.ibm.watson.modelmesh.example.api.Predictor.MultiPredictResponse;
 import com.ibm.watson.modelmesh.example.api.Predictor.PredictRequest;
 import com.ibm.watson.modelmesh.example.api.Predictor.PredictResponse;
-import com.ibm.watson.tas.internal.proto.ModelServerGrpc.ModelServerImplBase;
 import io.grpc.Context;
 import io.grpc.Contexts;
 import io.grpc.Metadata;
@@ -56,13 +48,15 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.atomic.LongAdder;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static java.lang.Integer.parseInt;
 
 /**
  * An example Model Serving runtime for use with the model-mesh framework
  */
-public class ExampleModelRuntime extends ModelServerImplBase {
+public class ExampleModelRuntime extends ModelRuntimeGrpc.ModelRuntimeImplBase { // ModelServerImplBase {
 
     public static final boolean FAST_MODE = !"false".equals(System.getenv("FAST_MODE"));
 
@@ -124,7 +118,7 @@ public class ExampleModelRuntime extends ModelServerImplBase {
 
     private Server[] buildIpServers(int managementPort, int servingPort) {
         if (managementPort == servingPort) return new Server[] { buildIpServer(managementPort) };
- 
+
         return new Server[] {
             addManagementService(serverBuilderForPort(managementPort)).build(),
             addPredictionService(serverBuilderForPort(servingPort)).build()
@@ -401,6 +395,8 @@ public class ExampleModelRuntime extends ModelServerImplBase {
             response.onCompleted();
         }
 
+        private static final Pattern ERR_REQ_PATT = Pattern.compile("test:error:code=(\\w+):message=(.+)");
+
         private PredictResponse doPredict(String modelId,
                 PredictRequest request, StreamObserver<?> response) {
 
@@ -413,6 +409,12 @@ public class ExampleModelRuntime extends ModelServerImplBase {
                     response.onError(io.grpc.Status.UNAVAILABLE
                             .withDescription("Request for unknown model: '" + modelId + "' is not found")
                             .asRuntimeException());
+                } else if ("true".equals(System.getenv("MLSERVER_NOT_FOUND_BEHAVIOUR"))) {
+                    // Simulate MLServer bug
+                    System.out.println("Responding with MLServer-specific \"not found\" error (INVALID_ARGUMENT code)");
+                    response.onError(io.grpc.Status.INVALID_ARGUMENT
+                        .withDescription("Model " + modelId + " with version  not found")
+                        .asRuntimeException());
                 } else {
                     response.onError(io.grpc.Status.NOT_FOUND.asException());
                 }
@@ -422,6 +424,15 @@ public class ExampleModelRuntime extends ModelServerImplBase {
             String stringToClassify = request.getText();
 
             performSpecialActions(stringToClassify);
+
+            Matcher m = ERR_REQ_PATT.matcher(stringToClassify);
+            if (m.matches()) {
+                // Decode request intended to return a specific error
+                response.onError(io.grpc.Status.fromCode(
+                        io.grpc.Status.Code.valueOf(m.group(1)))
+                        .withDescription(m.group(2)).asException());
+                return null;
+            }
 
             // perform the inferencing
             String classification = model.classify(stringToClassify);

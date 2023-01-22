@@ -31,15 +31,7 @@ import com.google.common.collect.Maps;
 import com.google.common.collect.ObjectArrays;
 import com.google.common.collect.Ordering;
 import com.google.common.collect.Sets;
-import com.google.common.util.concurrent.AbstractFuture;
-import com.google.common.util.concurrent.FutureCallback;
-import com.google.common.util.concurrent.Futures;
-import com.google.common.util.concurrent.ListenableFuture;
-import com.google.common.util.concurrent.ListenableFutureTask;
-import com.google.common.util.concurrent.ListeningScheduledExecutorService;
-import com.google.common.util.concurrent.MoreExecutors;
-import com.google.common.util.concurrent.UncheckedExecutionException;
-import com.google.common.util.concurrent.Uninterruptibles;
+import com.google.common.util.concurrent.*;
 import com.googlecode.concurrentlinkedhashmap.Weigher;
 import com.ibm.etcd.client.FutureListener;
 import com.ibm.watson.kvutils.DynamicConfig;
@@ -66,6 +58,7 @@ import com.ibm.watson.litelinks.server.ThriftService;
 import com.ibm.watson.modelmesh.ModelLoader.LoadedRuntime;
 import com.ibm.watson.modelmesh.ModelMesh.ExtendedStatusInfo.CopyInfo;
 import com.ibm.watson.modelmesh.ModelRecord.FailureInfo;
+import com.ibm.watson.modelmesh.TypeConstraintManager.ProhibitedTypeSet;
 import com.ibm.watson.modelmesh.clhm.ConcurrentLinkedHashMap;
 import com.ibm.watson.modelmesh.clhm.ConcurrentLinkedHashMap.EvictionListenerWithTime;
 import com.ibm.watson.modelmesh.thrift.ApplierException;
@@ -79,6 +72,7 @@ import com.ibm.watson.modelmesh.thrift.ModelNotFoundException;
 import com.ibm.watson.modelmesh.thrift.ModelNotHereException;
 import com.ibm.watson.modelmesh.thrift.Status;
 import com.ibm.watson.modelmesh.thrift.StatusInfo;
+import io.grpc.Context;
 import io.grpc.Status.Code;
 import io.grpc.StatusException;
 import io.grpc.StatusRuntimeException;
@@ -99,6 +93,7 @@ import org.eclipse.collections.api.map.primitive.ObjectLongMap;
 import org.eclipse.collections.impl.factory.primitive.ObjectLongMaps;
 import org.eclipse.collections.impl.list.mutable.primitive.IntArrayList;
 
+import javax.annotation.concurrent.GuardedBy;
 import java.io.File;
 import java.io.InterruptedIOException;
 import java.lang.management.ManagementFactory;
@@ -109,45 +104,10 @@ import java.lang.reflect.Method;
 import java.nio.channels.ClosedByInterruptException;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Comparator;
-import java.util.Date;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Map;
+import java.util.*;
 import java.util.Map.Entry;
-import java.util.NavigableSet;
-import java.util.NoSuchElementException;
-import java.util.Objects;
-import java.util.Set;
-import java.util.SortedSet;
-import java.util.TimeZone;
-import java.util.TreeMap;
-import java.util.TreeSet;
-import java.util.concurrent.BlockingQueue;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.ConcurrentMap;
-import java.util.concurrent.ConcurrentSkipListSet;
-import java.util.concurrent.ExecutionException;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Future;
-import java.util.concurrent.LinkedBlockingQueue;
-import java.util.concurrent.Phaser;
-import java.util.concurrent.PriorityBlockingQueue;
-import java.util.concurrent.RejectedExecutionException;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.Semaphore;
-import java.util.concurrent.ThreadLocalRandom;
-import java.util.concurrent.ThreadPoolExecutor;
-import java.util.concurrent.TimeoutException;
+import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.AtomicLongFieldUpdater;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.concurrent.atomic.AtomicReferenceFieldUpdater;
 import java.util.concurrent.atomic.LongAdder;
@@ -248,7 +208,10 @@ public abstract class ModelMesh extends ThriftService
     // used in routing decisions, gets set to Math.max(3000L, loadTimeoutMs/3)
     protected /*final*/ long defaultAssumeLoadedAfterMs;
 
-    public static final long LOAD_FAILURE_EXPIRY_MS = 600_000L; // 10mins for now
+    // time after which loading failure records expire (allowing for re-attempts)
+    public final long LOAD_FAILURE_EXPIRY_MS = getLongParameter(LOAD_FAILURE_EXPIRY_ENV_VAR, 900_000L); // default 15mins
+    // shorter expiry time for "in use" models (receiving recent requests)
+    public final long IN_USE_LOAD_FAILURE_EXPIRY_MS = LOAD_FAILURE_EXPIRY_MS / 2;
     public static final int MAX_LOAD_FAILURES = 3;
     // if unable to invoke in this many places, don't continue to load
     public static final int MAX_LOAD_LOCATIONS = 5;
@@ -265,29 +228,26 @@ public abstract class ModelMesh extends ThriftService
     public final long LOCAL_JANITOR_FREQ_SECS = Long.getLong("tas.janitor_freq_secs", 6 * 60); // 6mins
 
     // interval for rate checking task which tracks rate of reqs to each model
-    protected final long RATE_CHECK_INTERVAL_MS = Long.getLong("tas.ratecheck_freq_ms", 11_000L); // 11sec
+    protected final long RATE_CHECK_INTERVAL_MS = Long.getLong("tas.ratecheck_freq_ms", 10_000L); // 10sec
 
     protected static final int DEFAULT_SCALEUP_RPM = 2000;
 
-    /* If single-copy models are seen by the janitor to have been used
-     * within these times, it will ensure two copies are loaded (in
-     * different instances). A different "age" relative to the model's
-     * lastUsed cache timestamp is used depending on whether any "real"
-     * usage has been recorded yet for the model in this instance.
-     * The smaller time for the "unused" case is to avoid scaling up
-     * newly-added models which have a recent cache timestamp but have
-     * never actually been used.
-     * The times should be greater than the janitor frequency
+    /* These are the "ages" between which a prior use of a single-copy model will
+     * trigger a second copy to be loaded. Note that the actual precision corresponds
+     * to the period of the rateTrackingTask which has a default of 10 seconds.
+     * By default these values are 40 and 7 minutes respectively.
+     * This is a heuristic for identifying "regular" usage as apposed to one-off
+     * or short burst.
      */
-    public static final long SECOND_COPY_ADD_AGE_UNUSED_MS = 10 * 60_000L; // 10mins
-    public static final long SECOND_COPY_ADD_AGE_USED_MS = 12 * 3600_000L; // 12hours
+    protected final int SECOND_COPY_MAX_AGE_SECS = Integer.getInteger("mm.max_second_copy_age_secs", 2400);
+    protected final int SECOND_COPY_MIN_AGE_SECS = Integer.getInteger("mm.min_second_copy_age_secs", 420);
 
     /* Last-used age after which second model copies will be removed
      * (2->1 scaledown). Note this is a maximum and a smaller value might
-     * be used if the global age of the cache is small (less than 5x this value).
+     * be used if the global age of the cache is small (less than 10x this value).
      * Also note that scale-downs are only done if the cache is (globally) full.
      */
-    public static final long SECOND_COPY_REMOVE_MAX_AGE_MS = 16 * 3600_000L; // 16hours
+    public static final long SECOND_COPY_REMOVE_MAX_AGE_MS = 10 * 3600_000L; // 10hours
 
     /* When models are added to the cluster via the registerModel method with the
      * load parameter set to true, the recency timestamp of the loaded
@@ -307,6 +267,10 @@ public abstract class ModelMesh extends ThriftService
 
     // time before which we don't wait for migrated models to load elsewhere during pre-shutdown
     protected static final long CUTOFF_AGE_MS = 60 * 60_000L; // 1 hour
+
+    // when expiring failure records, use the shorter age if recent requests for the model
+    // have been seen within this time
+    protected static final long SHORT_EXPIRY_RECENT_USE_TIME_MS = 3 * 60_000L; // 3mins
 
     // max combined number of cache-hit/miss retries per request - mainly just a safeguard
     protected static final int MAX_ITERATIONS = 8;
@@ -433,8 +397,6 @@ public abstract class ModelMesh extends ThriftService
 
     protected final ListeningScheduledExecutorService taskPool;
 
-    protected final ThreadPoolExecutor evictionTaskThread; // single thread
-
     private final boolean isExternal = this instanceof SidecarModelMesh;
 
     protected /*final*/ boolean limitModelConcurrency;
@@ -504,18 +466,14 @@ public abstract class ModelMesh extends ThriftService
                 ThreadPoolHelper.threadFactory("mm-task-thread-%d"));
         stpe.setExecuteExistingDelayedTasksAfterShutdownPolicy(false);
         taskPool = MoreExecutors.listeningDecorator(stpe);
-        evictionTaskThread = new ThreadPoolExecutor(1, 1, 0L, MILLISECONDS, new LinkedBlockingQueue<>(),
-                ThreadPoolHelper.threadFactory("mm-evict-thread"));
     }
 
     static final Pattern VERSION_PATT = Pattern.compile(".+-(\\d{8})-(\\d+)");
-    @SuppressWarnings("serial")
     final SimpleDateFormat VERSION_SDF = new SimpleDateFormat("yyyyMMdd") {
         { setTimeZone(TimeZone.getTimeZone("GMT")); }
     };
 
     static final Pattern VERSION_PATT_OLD = Pattern.compile("(\\d{8}-\\d{4})(?:-(\\d+))?");
-    @SuppressWarnings("serial")
     final SimpleDateFormat VERSION_SDF_OLD = new SimpleDateFormat("yyyyMMdd-HHmm") {
         { setTimeZone(TimeZone.getTimeZone("GMT")); }
     };
@@ -546,6 +504,12 @@ public abstract class ModelMesh extends ThriftService
         }
         if (iface == null) {
             throw new Exception("Must implement subinterface of BaseModelMeshService.Iface");
+        }
+
+        // Validate some constants which can be overridden via system properties
+        if (SECOND_COPY_MAX_AGE_SECS < SECOND_COPY_MIN_AGE_SECS
+            || SECOND_COPY_MIN_AGE_SECS < 0) {
+            throw new Exception("Invalid value for overridden second-copy trigger age range");
         }
 
         // convert version string to long representation
@@ -739,9 +703,10 @@ public abstract class ModelMesh extends ThriftService
         // if explicit model unloading is required, set up the accounting of this
         // (special placeholder entry in the cache whose weight is adjusted dynamically)
         if (loader.requiresUnload()) {
-            // reserve part of the cache for unloads to prevent cascading evictions
-            int lowerBound = Math.toIntExact(runtimeCache.capacity() / 100);
-            int upperBound = Math.toIntExact(runtimeCache.capacity() / 10);
+            // reserve part of the cache for unloads to avoid blocking new loads in most cases
+            long cacheCapacity = runtimeCache.capacity();
+            int lowerBound = Math.toIntExact(cacheCapacity / 100);
+            int upperBound = Math.toIntExact(cacheCapacity / 10);
             int unitsToReserve = loadingThreads * defaultModelSizeUnits / (loadingThreads <= 2 ? 2 : 4);
 
             int unloadsReservedSizeUnits = Math.max(Math.min(unitsToReserve, upperBound), lowerBound);
@@ -1133,7 +1098,7 @@ public abstract class ModelMesh extends ThriftService
         taskPool.scheduleWithFixedDelay(invokeCounter.reqCounterTask(), 3L, 60L, SECONDS);
 
         // this task checks per model req rates and triggers model scale-out beyond 2 copies if necessary
-        taskPool.scheduleAtFixedRate(rateTrackingTask(), 7000L, RATE_CHECK_INTERVAL_MS, MILLISECONDS);
+        taskPool.scheduleAtFixedRate(rateTrackingTask(), RATE_CHECK_INTERVAL_MS / 2, RATE_CHECK_INTERVAL_MS, MILLISECONDS);
     }
 
     private static final String MIN_PRIOR_VERSION = "20170201-0000";
@@ -1578,15 +1543,15 @@ public abstract class ModelMesh extends ThriftService
 
     /* --------------------------------- local cache entry ------------------------------------------------------ */
 
-    @SuppressWarnings("rawtypes")
-    static final AtomicLongFieldUpdater<CacheEntry> LAST_2ND_COPY_TIME_UPDATER = AtomicLongFieldUpdater
-            .newUpdater(CacheEntry.class, "lastSecondCopyTriggerNanos");
-
     final CacheEntry<?> newInternalCacheEntry(String id, int weight) {
         CacheEntry<?> ce = new CacheEntry(id, weight);
         // timestamp is set to max long value so this will never be evicted
         runtimeCache.putIfAbsent(id, ce, Long.MAX_VALUE);
         return ce;
+    }
+
+    static String ceStateString(int st) {
+        return st >= 0 && st < CE_STATE_STRS.length ? CE_STATE_STRS[st] : "UNRECOGNIZED(" + st + ")";
     }
 
     /**
@@ -1602,6 +1567,15 @@ public abstract class ModelMesh extends ThriftService
         // Records time of first transition into any of SIZING/ACTIVE/FAILED states
         long loadCompleteTimestamp;
 
+        // These are used *only* by the rate tracking task and only when this is the only
+        // copy of the model. They track prior iteration numbers of the rateTrackingTask
+        // in which this model was observed to have been used.
+        // Addition of a second copy is triggered when a usage is detected and one of
+        // these prior recorded usage iterations falls within a particular range
+        // (corresponding to roughly > 7 mins and < 40 mins ago).
+        // earlierUseIteration <= lastUsedIteration is always true
+        int earlierUseIteration = Integer.MIN_VALUE, lastUsedIteration = Integer.MIN_VALUE;
+
         private CacheEntry(String modelId, int weight) { // not used for "real" entries
             this.modelId = modelId;
             this.modelInfo = null;
@@ -1616,7 +1590,7 @@ public abstract class ModelMesh extends ThriftService
                     .setEncKey(mr.getEncryptionKey()), failure);
         }
 
-        CacheEntry(CacheEntry<?> replaceFailed) { // for updating loadTimstamp of already-failed entries
+        CacheEntry(CacheEntry<?> replaceFailed) { // for updating loadTimestamp of already-failed entries
             this(replaceFailed.modelId, replaceFailed.modelInfo, replaceFailed.finalException());
         }
 
@@ -1652,20 +1626,6 @@ public abstract class ModelMesh extends ThriftService
             return invokeCompletionCount != null && invokeCompletionCount.sum() < invokeCount.sum();
         }
 
-        // ---------- second-copy trigger debounce -------------------
-
-        volatile long lastSecondCopyTriggerNanos;
-
-        // Note this is not required for correctness - only one ensureLoadedElsewhere
-        // call for a given model will "win", but it cuts down on unnecessary load
-        // when there are concurrent bursts of them
-        final boolean secondCopyTriggerDebounce(long nowMillis) {
-            long last = lastSecondCopyTriggerNanos;
-            // Rate limit to one per 10 seconds
-            return (last == 0L || nowMillis - last > 10_000L)
-                   && LAST_2ND_COPY_TIME_UPDATER.compareAndSet(this, last, nowMillis);
-        }
-
         // -------------- invocation rate tracking -------------------
 
         private final LongAdder invokeCount = new LongAdder();
@@ -1680,7 +1640,7 @@ public abstract class ModelMesh extends ThriftService
         // 3/4 of the scale-up req-load threshold
         // This variable is also used temporarily at creation
         // time, to record time spent in the loading queue
-        private long lastHeavyTime; //TODO volatile TBD
+        private volatile long lastHeavyTime;
 
         void recordInvocation(int weight) {
             invokeCount.add(weight);
@@ -1734,8 +1694,25 @@ public abstract class ModelMesh extends ThriftService
          */
         void updateWeight(int newWeight) {
             //TODO maybe ensure != 0
+            Lock cacheLock = runtimeCache.getEvictionLock();
+            cacheLock.lock();
+            try {
+                updateWeightLocked(newWeight);
+            } finally {
+                cacheLock.unlock();
+            }
+        }
+
+        @GuardedBy("runtimeCache.getEvictionLock()")
+        void updateWeightLocked(int newWeight) {
+            int oldWeight = this.weight;
+            if (oldWeight == newWeight) {
+                return;
+            }
             this.weight = newWeight;
-            runtimeCache.replaceQuietly(modelId, this, this);
+            if (!runtimeCache.replaceQuietly(modelId, this, this)) {
+                this.weight = oldWeight;
+            }
         }
 
         final int loaderPredictedWeight() {
@@ -1804,8 +1781,7 @@ public abstract class ModelMesh extends ThriftService
         private volatile int state = NEW;
 
         final String stateString() {
-            int st = state;
-            return st >= 0 && st < CE_STATE_STRS.length ? CE_STATE_STRS[st] : "UNRECOGNIZED(" + st + ")";
+            return ModelMesh.ceStateString(state);
         }
 
         // this is updated prior to attempts to deregister+unload the
@@ -1818,41 +1794,44 @@ public abstract class ModelMesh extends ThriftService
             return age(lastUnloadAttemptTime) < 600_000L; // 10 mins
         }
 
-        // this is passed as the lastUsed time to the remove method below
-        // to indicate the model is already unloaded from the runtime
-        // (so no need to call unloadModel as a removal step)
-        public static final long ALREADY_UNLOADED = 20L;
-
         public final boolean remove() {
-            return remove(false, 0L);
+            return remove(false);
         }
 
         /**
-         * abort loading. unless shutting down, the entry will also be removed
-         * from the cache
+         * Abort loading. The entry will also be removed from the cache
          *
-         * @param evicted  if already evicted from cache
-         * @param lastUsed lastUsed time, 0L for unknown or none,
-         *                 ALREADY_UNLOADED if already unloaded (e.g. runtime reported not found)
+         * @param alreadyUnloaded true if already unloaded (e.g. runtime reported not found)
          */
-        public final synchronized boolean remove(boolean evicted, long lastUsed) {
-            final int stateNow = state;
-
-            if (stateNow >= REMOVED) {
+        public final boolean remove(final boolean alreadyUnloaded) {
+            if (state >= REMOVED) {
                 return false;
             }
 
-            final boolean isShuttingDown = shuttingDown;
-
-            if (lastUsed <= 0L) {
-                lastUsed = stateNow <= LOADING || evicted ? 10L : runtimeCache.getLastUsedTime(modelId);
+            // return false immediately if not evicted and no longer in cache; removal processing
+            // will be performed by another thread that did the cache removal or eviction
+            if (unloadManager == null) {
+                return runtimeCache.remove(modelId, this) && doRemove(false, -1, alreadyUnloaded);
             }
+            int removalWeight = unloadManager.removeEntry(this);
+            return removalWeight != -1 && doRemove(false, removalWeight, alreadyUnloaded);
+        }
 
-            if (!evicted && (lastUsed <= 0L || (!isShuttingDown ? !runtimeCache.remove(modelId, this)
-                    // don't actually remove from cache if shutting down
-                    // (avoid GC pressure)
-                    : runtimeCache.getQuietly(modelId) != this))) {
-                return false; // no longer in cache
+        /**
+         * Called after an entry is removed or evicted. unloadManager.entryRemoved or removeEntry must have
+         * first been called.
+         *
+         * @param evicted  if already evicted from cache
+         * @param removalWeight weight upon removal, only required if unloadManager != null
+         * @param alreadyUnloaded true if already unloaded (e.g. runtime reported not found)
+         * @return
+         */
+        final synchronized boolean doRemove(final boolean evicted,
+                                            final int removalWeight,
+                                            final boolean alreadyUnloaded) {
+            int stateNow = state;
+            if (stateNow >= REMOVED) {
+                return false;
             }
 
             // important that this state change is prior to the cancel() below
@@ -1878,28 +1857,30 @@ public abstract class ModelMesh extends ThriftService
                     ListenableFuture<Void> lfut = loadFuture;
                     if (lfut != null) {
                         logger.info("Cancelling in-progress loading of model "
-                                    + modelId + " due to removal (state was " + stateNow + ")");
+                                + modelId + " due to removal (state was " + ModelMesh.ceStateString(stateNow) + ")");
                         lfut.cancel(true);
                     }
                 }
                 if (unloadManager != null) {
                     if (stateNow == NEW || stateNow == QUEUED || stateNow == WAITING) {
-                        unloadManager.cancelSpaceRequestForNewEntry(this);
-                    } else if (stateNow == LOADING) {
+                        // no more unload accounting to perform (already reverted by unloadManager.entryRemoved)
+                        return true;
+                    }
+                    if (stateNow == LOADING) {
                         // this delay is to add a buffer between
                         // cancelling the in-progress load and
                         // initiating the subsequent unload
                         unloadDelayMs = evicted ? 500L : 3000L;
                     }
                 }
-            } else if (stateNow <= ACTIVE && lastUsed != ALREADY_UNLOADED) {
+            } else if (stateNow <= ACTIVE && !alreadyUnloaded) {
                 // state is SIZING or ACTIVE
                 if (stateNow == SIZING) {
                     // cancel the in-progress sizing
                     ListenableFuture<Void> lfut = loadFuture;
                     if (lfut != null && lfut.cancel(true)) {
                         logger.info("Cancelled in-progress sizing of model "
-                                    + modelId + " due to removal (state was " + SIZING + ")");
+                                + modelId + " due to removal (state was " + SIZING + ")");
                     }
                 }
 
@@ -1919,14 +1900,15 @@ public abstract class ModelMesh extends ThriftService
                     metrics.logCounterMetric(Metric.UNLOAD_MODEL);
                 }
             }
-            // else will already have been unloaded
-            else if (state == FAILED && unloadManager != null) {
-                unloadManager.discardFailedEntry(FAILED_WEIGHT);
-            }
 
-            if (unloadDelayMs >= 0L && !isShuttingDown) {
-                // here state == LOADING or ACTIVE
-                triggerUnload(getWeight(), unloadDelayMs);
+            if (unloadManager != null) {
+                if (unloadDelayMs < 0L) {
+                    // Unload is already done or not applicable
+                    unloadManager.unloadComplete(removalWeight, true, modelId);
+                } else if (!shuttingDown) {
+                    // here state == LOADING or ACTIVE
+                    triggerUnload(removalWeight, unloadDelayMs);
+                }
             }
 
             return true;
@@ -1942,7 +1924,6 @@ public abstract class ModelMesh extends ThriftService
             if (unloadManager == null) {
                 return;
             }
-            unloadManager.initiateUnload(weight);
             long startNanos = nanoTime();
             if (initialDelayMs == 0L) {
                 unloadIfIdle(weight, 1, startNanos);
@@ -1998,12 +1979,29 @@ public abstract class ModelMesh extends ThriftService
                     if (shuttingDown) {
                         return; // ignore if shutting down
                     }
-                    logger.error("Unload failed for model " + modelId + " type=" + modelInfo.getServiceType()
+                    String type = modelInfo != null ? modelInfo.getServiceType() : "N/A";
+                    logger.error("Unload failed for model " + modelId + " type=" + type
                                  + " after " + msSince(beforeNanos) + "ms", throwable);
                     unloadManager.unloadComplete(weight, false, modelId);
                     metrics.logCounterMetric(Metric.UNLOAD_MODEL_FAILURE);
                 }
             }, directExecutor());
+        }
+
+        final void setLoadingQueueStartTime() {
+            // lastHeavyTime field is used to store loading queue start time
+            // when cache entry is in QUEUED state only
+            assert state == QUEUED;
+            lastHeavyTime = nanoTime();
+        }
+
+        final long getAndResetLoadingQueueStartTimeNanos() {
+            // lastHeavyTime field is used to store loading queue start time
+            // when cache entry is in QUEUED state only
+            assert state == QUEUED;
+            long startTime = lastHeavyTime;
+            lastHeavyTime = 0L;
+            return startTime;
         }
 
         /**
@@ -2042,8 +2040,7 @@ public abstract class ModelMesh extends ThriftService
 
             logger.info("About to enqueue load for model " + modelId + " with initial weight " + absWeight + " units (~"
                         + mb(absWeight * UNIT_SIZE) + "), with priority " + priority);
-            // lastHeavyTime var used *temporarily* to record time spent in loading queue
-            lastHeavyTime = nanoTime();
+            setLoadingQueueStartTime();
             try {
                 loadingPool.execute(this);
             } catch (RejectedExecutionException ree) {
@@ -2088,10 +2085,9 @@ public abstract class ModelMesh extends ThriftService
                         return;
                     }
                     decrementLoadingCount = true;
-                    // lastHeavyTime is used for queue start time when in this state
-                    if (lastHeavyTime > 0) {
-                        long queueDelayMillis = (nanoTime() - lastHeavyTime) / M;
-                        lastHeavyTime = 0L;
+                    long queueStartTimeNanos = getAndResetLoadingQueueStartTimeNanos();
+                    if (queueStartTimeNanos > 0) {
+                        long queueDelayMillis = (nanoTime() - queueStartTimeNanos) / M;
                         metrics.logSizeEventMetric(Metric.LOAD_MODEL_QUEUE_DELAY, queueDelayMillis);
                         // Only log if the priority value is "in the future" which indicates
                         // that there is or were runtime requests waiting for this load.
@@ -2201,7 +2197,7 @@ public abstract class ModelMesh extends ThriftService
             }
         }
 
-        private void waitForSpaceToLoad(int required) throws Exception {
+        private void waitForSpaceToLoad(final int required) throws Exception {
             //assert unloadManager != null;
             // here state == WAITING; we wait if necessary for cache space to become available
             //  -- specifically that we can add back our prior subtraction from the aggregate
@@ -2217,8 +2213,9 @@ public abstract class ModelMesh extends ThriftService
                                         + " pre-load waiting for space to become available"));
                     }
                     synchronized (CacheEntry.this) {
-                        if (state != WAITING) {
-                            throw new Exception("State of model " + modelId + " changed to " + stateString()
+                        final int st = state;
+                        if (st != WAITING) {
+                            throw new Exception("State of model " + modelId + " changed to " + ModelMesh.ceStateString(st)
                                                 + " during pre-load waiting, aborting load");
                         }
                         if (unloadManager.claimRequestedSpaceIfReady(required)) {
@@ -2375,7 +2372,10 @@ public abstract class ModelMesh extends ThriftService
 
         // Called at most once, by the thread which moved the state to FAILED.
         // unloadDelay == -1L means load wasn't attempted so don't unload at all
-        private boolean failed(Throwable t, long unloadDelay) {
+        private void failed(Throwable t, long unloadDelay) {
+            if (state != FAILED) {
+                return;
+            }
 
             boolean isShuttingDown = shuttingDown;
             if (!isShuttingDown) {
@@ -2385,9 +2385,21 @@ public abstract class ModelMesh extends ThriftService
             int weightBefore;
             synchronized (CacheEntry.this) {
                 weightBefore = getWeight();
-                updateWeight(FAILED_WEIGHT);
-                if (!isShuttingDown && unloadDelay >= 0) {
-                    triggerUnload(weightBefore - FAILED_WEIGHT, unloadDelay);
+                int weightReduction = weightBefore - FAILED_WEIGHT;
+                if (weightReduction != 0) {
+                    if (unloadManager != null) {
+                        // Though this method is written the new entry adjustment, the accounting
+                        // is identical to what we need here when reducing the size of the failed
+                        // entry and triggering an unload tied to that space reduction.
+                        unloadManager.adjustNewEntrySpaceRequest(-weightReduction, this, false);
+                        if (!isShuttingDown && unloadDelay >= 0) {
+                            triggerUnload(weightReduction, unloadDelay);
+                        } else {
+                            unloadManager.unloadComplete(weightReduction, true, modelId);
+                        }
+                    } else {
+                        updateWeight(FAILED_WEIGHT);
+                    }
                 }
             }
 
@@ -2396,7 +2408,7 @@ public abstract class ModelMesh extends ThriftService
                 ModelRecord mr = registry.getOrStrongIfAbsent(modelId);
                 while (true) {
                     if (mr == null) {
-                        return true; // deleted while loading
+                        return; // deleted while loading
                     }
                     if (lastUsed <= 0L) {
                         lastUsed = mr.getLastUsed();
@@ -2441,7 +2453,6 @@ public abstract class ModelMesh extends ThriftService
                                  + modelId, e);
                 }
             }
-            return true;
         }
 
         // Used when there is a failure updating the KV registry prior to a load attempt
@@ -2548,7 +2559,7 @@ public abstract class ModelMesh extends ThriftService
     static final ApplierException QUEUE_BREACH_EXCEPTION = noStack(
             new ApplierException("Model queue overload", null, RESOURCE_EXHAUSTED));
 
-    static boolean isExhausted(Exception e) {
+    static boolean isExhausted(Throwable e) {
         return e instanceof ApplierException && RESOURCE_EXHAUSTED.equals(((ApplierException) e).getGrpcStatusCode());
     }
 
@@ -2784,12 +2795,20 @@ public abstract class ModelMesh extends ThriftService
     @Override
     public void onEviction(String key, CacheEntry<?> ce, long lastUsed) {
         long now = currentTimeMillis();
+
         // Log prior to dispatch so we can see thread which triggered the eviction
-        logger.info("Eviction triggered for model " + key + " (weight=" + ce.getWeight() + ")");
-        // eviction can be triggered synchronously by arbitrary cache reads/writes,
-        // so always dispatch in separate thread (avoid hidden deadlocks and minimize
-        // latency impact on serving request threads)
-        evictionTaskThread.execute(() -> {
+        int removalWeight = ce.getWeight();
+        logger.info("Eviction triggered for model " + key
+            + " (weight=" + removalWeight + " / " + mb(removalWeight * UNIT_SIZE) + ")");
+
+        // we hold the eviction lock here
+        if (unloadManager != null) {
+            unloadManager.entryRemoved(removalWeight);
+        }
+
+        // perform deregistration and removal re-attempt on regular task thread; eviction
+        // callbacks are now performed under the cache lock
+        taskPool.execute(() -> {
             // determine whether a reload should be attempted elsewhere:
             // *don't* reload if this was a cached load failure, or was
             // only just loaded (e.g. an immediate eviction)
@@ -2810,40 +2829,35 @@ public abstract class ModelMesh extends ThriftService
             if (inRegistry || failed) {
                 // don't record "immediate" evictions (additions too old to fit in cache at all)
                 logger.info("Evicted " + (failed ? "failed model record" : "model") + " " + key
-                            + " from local cache, last used " + readableTime(millisSinceLastUsed) + " ago (" + lastUsed
-                            + "ms), invoked " + ce.getTotalInvocationCount() + " times");
+                    + " from local cache, last used " + readableTime(millisSinceLastUsed) + " ago (" + lastUsed
+                    + "ms), invoked " + ce.getTotalInvocationCount() + " times");
                 metrics.logTimingMetricDuration(Metric.AGE_AT_EVICTION, millisSinceLastUsed, false);
                 metrics.logCounterMetric(Metric.EVICT_MODEL);
             }
 
-            // perform deregistration and removal re-attempt on regular task thread;
-            // it's important we don't hold up the single eviction thread
-            final boolean attemptReloadAfter = attemptReload;
-            taskPool.execute(() -> {
-                // remove our record from registry
-                deregisterModel(key, lastUsed, ce.loadTimestamp, ce.loadCompleteTimestamp);
+            // abort/unload model
+            ce.doRemove(true, removalWeight, false);
 
-                if (attemptReloadAfter) {
-                    // if the cluster is less than 95% full, attempt to re-load this model elsewhere
-                    // (rebalancing)
-                    ClusterStats stats = typeSetStats(ce.modelInfo.getServiceType());
-                    if (stats.totalCapacity > 0 && stats.instanceCount > 1
-                        && ((20L * stats.totalFree) / stats.totalCapacity) >= 1) {
-                        try {
-                            StatusInfo si = ensureLoadedElsewhere(key, lastUsed, ce.getWeight());
-                            if (si.getStatus() == Status.LOADING) {
-                                logger.info("Triggered load of evicted model "
-                                        + key + " elsewhere (cluster isn't full)");
-                            }
-                        } catch (Exception e) {
-                            logger.warn("Exception attempting to load evicted model " + key + " elsewhere");
+            // remove our record from registry
+            deregisterModel(key, lastUsed, ce.loadTimestamp, ce.loadCompleteTimestamp);
+
+            if (attemptReload) {
+                // if the cluster is less than 95% full, attempt to re-load this model elsewhere
+                // (rebalancing)
+                ClusterStats stats = typeSetStats(ce.modelInfo.getServiceType());
+                if (stats.totalCapacity > 0 && stats.instanceCount > 1
+                    && ((20L * stats.totalFree) / stats.totalCapacity) >= 1) {
+                    try {
+                        StatusInfo si = ensureLoadedElsewhere(key, lastUsed, ce.getWeight());
+                        if (si.getStatus() == Status.LOADING) {
+                            logger.info("Triggered load of evicted model "
+                                + key + " elsewhere (cluster isn't full)");
                         }
+                    } catch (Exception e) {
+                        logger.warn("Exception attempting to load evicted model " + key + " elsewhere");
                     }
                 }
-            });
-
-            // abort/unload model
-            ce.remove(true, lastUsed);
+            }
         });
     }
 
@@ -2891,7 +2905,6 @@ public abstract class ModelMesh extends ThriftService
 
     /* --------------------------------- StatusInfo constants ---------------------------------------------------- */
 
-    @SuppressWarnings("serial")
     public static final class ExtendedStatusInfo extends StatusInfo {
         public static final class CopyInfo implements Comparable<CopyInfo> {
             static final CopyInfo[] EMPTY = new CopyInfo[0];
@@ -3227,7 +3240,6 @@ public abstract class ModelMesh extends ThriftService
     static final String TAS_INTERNAL_CXT_KEY = "tas.internal";
     static final String CACHE_HIT_EXCLUDES_KEY = "tas.ch_excludes";
     static final String CACHE_MISS_EXCLUDES_KEY = "tas.cm_excludes";
-    static final String LOAD_NEW_COPY_CXT_KEY = "tas.load_new_copy"; // used only with hit_only
     static final String BATCH_COUNT_CXT_KEY = "tas.batch_mult"; // used only with hit_only
     static final String CHAINED_LOAD_COUNT_KEY = "tas.chain_load_count";
     static final String KNOWN_SIZE_CXT_KEY = "tas.known_size";
@@ -3237,7 +3249,7 @@ public abstract class ModelMesh extends ThriftService
     // these are the possible values for the tas.internal context parameter
     // it won't be set on requests from outside of the cluster, and will
     // always be set to one of the below values for requests inside the cluster
-    static final String HIT_ONLY = "hit_only";
+    static final String HIT_ONLY = "hit_only", INTERNAL_REQ = "internal";
     static final String LOAD_LOCAL_ONLY = "load_local_only", FORCE_LOCAL_LOAD = "force_local_load";
 
     static final Splitter COMMA_SPLIT = Splitter.on(',');
@@ -3348,17 +3360,32 @@ public abstract class ModelMesh extends ThriftService
         }
 
         final String tasInternal = contextMap.get(TAS_INTERNAL_CXT_KEY);
+        // Set the external request flag if it's not a tasInternal call or if
+        // tasInternal == INTERNAL_REQ. The latter is a new ensureLoaded
+        // invocation originating from within the cluster.
+        final boolean externalReq;
+        boolean local = false;
+        final String hopType;
+        if (tasInternal == null) {
+            externalReq = true;
+            hopType = "ex"; // "ex-ternal"
+        } else if (INTERNAL_REQ.equals(tasInternal)) {
+            externalReq = true;
+            hopType = "in"; // "in-ternal"
+        } else if (HIT_ONLY.equals(tasInternal)) {
+            externalReq = false;
+            local = true;
+            hopType = "ho"; // "hit-only"
+        } else {
+            externalReq = false;
+            hopType = "ll"; // "load-local"
+        }
 
-        long methodStartNanos = !isExternal && tasInternal == null && method != null
-                ? nanoTime() : 0L; // just for non-grpc api metric case
+        // just for non-grpc api metric case
+        long methodStartNanos = !isExternal && externalReq && method != null ? nanoTime() : 0L;
         Code metricStatusCode = Code.OK;
 
-        final boolean local = HIT_ONLY.equals(tasInternal);
-        // set the external request flag if it's not a tasInternal call
-        final boolean externalReq = tasInternal == null;
-
         final Thread curThread = Thread.currentThread();
-        String hopType = tasInternal == null ? "ex" : (local ? "ho" : "ll"); // "ex-ternal", "hit-only", "load-local"
         final String threadNameBefore = setThreadName(curThread, "invoke-" + hopType + '-' + modelId);
         ModelRecord mr = null;
         try {
@@ -3403,11 +3430,6 @@ public abstract class ModelMesh extends ThriftService
                 CacheEntry<?> ce = getFromCache(modelId, lastUsedTime);
                 if (ce == null) {
                     throw new ModelNotHereException(instanceId, modelId);
-                }
-                // if caller determined that loading of a second copy of this model should be
-                // triggered as a result of this request, do it
-                if (lastUsedTime >= 0 && "true".equals(contextMap.get(LOAD_NEW_COPY_CXT_KEY))) {
-                    addSecondCopyAsync(modelId, lastUsedTime, currentTimeMillis(), ce);
                 }
                 try {
                     return invokeLocalModel(ce, method, args, modelId);
@@ -3530,7 +3552,6 @@ public abstract class ModelMesh extends ThriftService
                             }
                         }
 
-                        Boolean addSecondCopy = null;
                         if (!goLocal) {
                             // here we might be sending elsewhere in the cluster
                             // (or definitely so in balanced case, where we would have
@@ -3544,18 +3565,6 @@ public abstract class ModelMesh extends ThriftService
                                 // call "local only" version of prediction
                                 contextMap = ensureContextMapIsMutable(contextMap);
                                 contextMap.put(TAS_INTERNAL_CXT_KEY, HIT_ONLY);
-                                // determine whether the receiving instance should trigger
-                                // loading of another copy of the model. if so, indicate via context param
-                                if (lastUsedTime >= 0) {
-                                    long now = currentTimeMillis(), age = lastUsedTime == 0L ? 0L : now - lastUsedTime;
-                                    addSecondCopy = modelCopyShouldBeAdded(mr.getInstanceIds(),
-                                            age, now, false, mr.getType());
-                                }
-                                if (Boolean.TRUE.equals(addSecondCopy)) {
-                                    contextMap.put(LOAD_NEW_COPY_CXT_KEY, "true");
-                                } else {
-                                    contextMap.remove(LOAD_NEW_COPY_CXT_KEY);
-                                }
                                 if (logger.isDebugEnabled()) {
                                     logger.debug("model=" + modelId + " about to invoke other instances. tofilter="
                                                  + filtered);
@@ -3563,15 +3572,18 @@ public abstract class ModelMesh extends ThriftService
                                 Object result = invokeRemote(runtimeClient, method, remoteMeth, modelId, args);
                                 return method == null && externalReq ? updateWithModelCopyInfo(result, mr) : result;
                             } catch (Exception e) {
-                                boolean callFailed = processRemoteInvocationException(e, modelId); // this may throw
+                                final Throwable t = e instanceof InvocationTargetException ? e.getCause() : e;
+                                final boolean callFailed = processRemoteInvocationException(t, modelId); // this may throw
                                 if (callFailed) {
-                                    if (e instanceof ModelLoadException) {
-                                        loadFailureSeen = (ModelLoadException) e;
+                                    if (t instanceof ModelLoadException) {
+                                        loadFailureSeen = (ModelLoadException) t;
                                         updateLocalModelRecordAfterRemoteLoadFailure(mr, loadFailureSeen);
-                                    } else if (e instanceof InternalException) {
-                                        internalFailureSeen = (InternalException) e;
-                                    } else if (isExhausted(e) && ++resExaustedCount >= MAX_RES_EXHAUSTED) {
-                                        throw e;
+                                    } else if (t instanceof InternalException) {
+                                        internalFailureSeen = (InternalException) t;
+                                    } else if (isExhausted(t) && ++resExaustedCount >= MAX_RES_EXHAUSTED) {
+                                        Throwables.throwIfInstanceOf(t, Error.class);
+                                        Throwables.throwIfInstanceOf(t, Exception.class);
+                                        throw new IllegalStateException(t); // should not happen
                                     }
                                     continue;
                                 }
@@ -3611,25 +3623,18 @@ public abstract class ModelMesh extends ThriftService
                                             ModelLoadException mle = newModelLoadException(
                                                     "KV store error attempting to prune model record: " + e,
                                                     KVSTORE_LOAD_FAILURE, e);
-                                            CacheEntry<?> failedEntry = new CacheEntry<>(modelId, mr, mle);
-                                            cacheEntry = unloadManager != null
-                                                ? unloadManager.insertFailedPlaceholderEntry(modelId, failedEntry, Long.MAX_VALUE)
-                                                : runtimeCache.putIfAbsent(modelId, failedEntry, Long.MAX_VALUE);
+                                            if (io.grpc.Status.fromThrowable(e).getCode() != Code.CANCELLED) {
+                                                CacheEntry<?> failedEntry = new CacheEntry<>(modelId, mr, mle);
+                                                cacheEntry = unloadManager != null
+                                                        ? unloadManager.insertFailedPlaceholderEntry(modelId, failedEntry, mr.getLastUsed())
+                                                        : runtimeCache.putIfAbsent(modelId, failedEntry, mr.getLastUsed());
+                                            }
                                             if (cacheEntry == null) {
                                                 throw mle;
                                             }
                                             // else fall-through
                                         }
                                     }
-                                }
-                                // trigger load of additional copy of model if applicable
-                                if (Boolean.TRUE.equals(addSecondCopy)) {
-                                    // we already determined second-copy trigger is necessary
-                                    addSecondCopyAsync(modelId, lastUsedTime, currentTimeMillis(), cacheEntry);
-                                } else if (addSecondCopy == null && lastUsedTime >= 0) {
-                                    // not yet determined either way
-                                    addSecondCopyIfNecessary(modelId, cacheEntry, mr.getInstanceIds(), lastUsedTime,
-                                            currentTimeMillis(), false);
                                 }
                                 filtered.add(instanceId, localLoaded);
                                 if (!favourSelfForHits) {
@@ -3690,7 +3695,7 @@ public abstract class ModelMesh extends ThriftService
                     }
 
                     // don't attempt to load if there already are >= MAX_LOAD_FAILURES recent load failures (these will expire)
-                    checkLoadFailureCount(modelId, mr, loadFailureSeen);
+                    checkLoadFailureCount(mr, loadFailureSeen);
 
                     // don't attempt load if failed to invoke in > N already loaded locations
                     checkLoadLocationCount(mr, explicitExcludes, internalFailureSeen);
@@ -3738,16 +3743,19 @@ public abstract class ModelMesh extends ThriftService
                                 Object result = invokeRemote(cacheMissClient, method, remoteMeth, modelId, args);
                                 return method == null && externalReq ? updateWithModelCopyInfo(result, mr) : result;
                             } catch (Exception e) {
-                                boolean callFailed = processRemoteInvocationException(e, modelId); // this may throw
+                                final Throwable t = e instanceof InvocationTargetException ? e.getCause() : e;
+                                final boolean callFailed = processRemoteInvocationException(t, modelId); // this may throw
                                 //TODO handle "stale" case here
                                 if (callFailed) {
-                                    if (e instanceof ModelLoadException) {
-                                        loadFailureSeen = (ModelLoadException) e;
+                                    if (t instanceof ModelLoadException) {
+                                        loadFailureSeen = (ModelLoadException) t;
                                         updateLocalModelRecordAfterRemoteLoadFailure(mr, loadFailureSeen);
-                                    } else if (e instanceof InternalException) {
-                                        internalFailureSeen = (InternalException) e;
-                                    } else if (isExhausted(e) && ++resExaustedCount >= MAX_RES_EXHAUSTED) {
-                                        throw e;
+                                    } else if (t instanceof InternalException) {
+                                        internalFailureSeen = (InternalException) t;
+                                    } else if (isExhausted(t) && ++resExaustedCount >= MAX_RES_EXHAUSTED) {
+                                        Throwables.throwIfInstanceOf(t, Error.class);
+                                        Throwables.throwIfInstanceOf(t, Exception.class);
+                                        throw new IllegalStateException(t); // should not happen
                                     }
                                     // continue inner loop
                                     if (++n >= MAX_ITERATIONS) {
@@ -3767,7 +3775,8 @@ public abstract class ModelMesh extends ThriftService
                                     (contextMap = ensureContextMapIsMutable(contextMap)).remove(DEST_INST_ID_KEY);
                                 }
                             }
-                        } else // this is an internal "load" request (forwarded from another cluster instance)
+                        } else {
+                            // this is an internal "load" request (forwarded from another cluster instance)
                             if (!FORCE_LOCAL_LOAD.equals(tasInternal)) {
                                 //  here test if this instance is considered a suitable candidate,
                                 //  follow same logic as in CacheMissForwardingLB
@@ -3777,30 +3786,13 @@ public abstract class ModelMesh extends ThriftService
                                     throw new ModelLoadException(); //TODO .. should specifically reflect "stale info"
                                 }
                             }
+                        }
 
                         // here either the local instance was chosen as the target,
                         // no other instances were found/worked,
                         // or it's an internal req meaning the model can only be loaded locally
-                        if (loadTargetFilter != null && loadTargetFilter.isExcluded(instanceId)) {
-                            if (!externalReq) {
-                                // should not be LOAD_LOCAL_ONLY && local filtered
-                                throw newInternalException("Cluster routing error", null);
-                            }
-                            // here loading failed everywhere
-                            if (loadFailureSeen != null) {
-                                throw loadFailureSeen;
-                            }
-                            if (mr.hasLoadFailure()) {
-                                String failInstance = getMostRecent(mr.getLoadFailedInstanceIds());
-                                throw new ModelLoadException(mr.getLoadFailureMessage(failInstance),
-                                        failInstance, 0L, null);
-                            }
-                            if (internalFailureSeen != null) {
-                                throw internalFailureSeen;
-                            }
-                            //maybe define specific exception
-                            throw new ModelLoadException("Nowhere available to load", null, 0L, null);
-                        }
+                        throwIfLocalLoadNotAllowed(modelId, externalReq, mr, loadTargetFilter,
+                                loadFailureSeen, internalFailureSeen);
 
                         // limit the rate of cache churn - if we are full and our LRU entry is recent,
                         // reject the load rather than thrashing
@@ -3907,9 +3899,9 @@ public abstract class ModelMesh extends ThriftService
                 if (cacheMissTlSet) cacheMissExcludeTl.set(null);
             }
 
-        } catch (InterruptedException e) {
+        } catch (InterruptedException ie) {
             metricStatusCode = Code.CANCELLED;
-            throw newInternalException("Interrupted while waiting for load of model " + modelId, e);
+            throw newInternalInterruptedException(ie, "load of model " + modelId);
         } catch (Exception e) {
             metricStatusCode = methodStartNanos > 0L && isInterruption(e) ? Code.CANCELLED : Code.UNKNOWN;
             if (method == null && externalReq && e instanceof ModelLoadException) {
@@ -3928,10 +3920,51 @@ public abstract class ModelMesh extends ThriftService
         } finally {
             if (methodStartNanos > 0L && metrics.isEnabled()) {
                 // only logged here in non-grpc (legacy) mode
-                metrics.logApplyMethodTookNanosMetric(true, getRequestMethodName(method, args),
-                        nanoTime() - methodStartNanos, metricStatusCode);
+                metrics.logRequestMetrics(true, getRequestMethodName(method, args),
+                        nanoTime() - methodStartNanos, metricStatusCode, -1, -1);
             }
             curThread.setName(threadNameBefore);
+        }
+    }
+
+    private void throwIfLocalLoadNotAllowed(String modelId, boolean externalReq, ModelRecord mr,
+                                            CacheMissExcludeSet loadTargetFilter,
+                                            ModelLoadException loadFailureSeen, TException internalFailureSeen) throws TException {
+        // Called after the decision has been made to attempt to load the model on the local instance
+
+        // We need to check that
+        // - The load target filter doesn't exclude us
+        // - If there are type constraints, that they don't exclude us
+        boolean localFiltered = loadTargetFilter != null && loadTargetFilter.isExcluded(instanceId);
+        Set<String> constrainTo;
+        boolean blockedByTypeConstraint = typeConstraints != null
+                && (constrainTo = typeConstraints.getCandidateInstances(mr.getType())) != null
+                && !constrainTo.contains(instanceId);
+        if (localFiltered || blockedByTypeConstraint) {
+            // We're not eligible to load the model, figure out why and throw an exception
+            if (!externalReq) {
+                // should not be LOAD_LOCAL_ONLY && local filtered
+                throw newInternalException("Cluster routing error", null);
+            }
+            // here loading failed everywhere
+            if (loadFailureSeen != null) {
+                throw loadFailureSeen;
+            }
+            if (mr.hasLoadFailure()) {
+                String failInstance = getMostRecent(mr.getLoadFailedInstanceIds());
+                throw new ModelLoadException(mr.getLoadFailureMessage(failInstance),
+                        failInstance, 0L, null);
+            }
+            if (internalFailureSeen != null) {
+                throw internalFailureSeen;
+            }
+            // Reaching here is unexpected and implies some kind of state inconsistency.
+            // Log with some additional diagnostic info.
+            logger.warn("Nowhere available to load for model " + modelId + ": type=" + mr.getType()
+                + ", constraintBlocked=" + blockedByTypeConstraint + ", loadTargetFilter=" + loadTargetFilter
+                    + ", instanceTable=" + Iterables.toString(instanceInfo.keyIterable()));
+            //maybe define specific exception
+            throw new ModelLoadException("Nowhere available to load", null, 0L, null);
         }
     }
 
@@ -4109,17 +4142,16 @@ public abstract class ModelMesh extends ThriftService
     }
 
     /**
-     * @param e
+     * @param t
      * @return true if remote call failed, false if call wasn't made (due to unavailability or
      * indication that local attempt should be made)
      * @throws TException
      */
-    protected boolean processRemoteInvocationException(Exception e, String modelId) throws TException {
-        if (e instanceof IllegalAccessException || e instanceof RuntimeException) {
+    protected boolean processRemoteInvocationException(Throwable t, String modelId) throws TException {
+        if (t instanceof IllegalAccessException || t instanceof RuntimeException) {
             throw newInternalException(
-                    "Unexpected exception while attempting remote invocation for model " + modelId, e);
+                    "Unexpected exception while attempting remote invocation for model " + modelId, t);
         } else {
-            Throwable t = e instanceof InvocationTargetException ? e.getCause() : e;
             if (t.getCause() instanceof ServiceUnavailableException) {
                 return false;
             } else if (t instanceof ModelNotHereException) {
@@ -4135,10 +4167,9 @@ public abstract class ModelMesh extends ThriftService
                        || t instanceof TProtocolException
                        || t instanceof TApplicationException
                        || t instanceof RuntimeException) {
-                if (isInterruption(t)) {
-                    Throwables.throwIfInstanceOf(t, RuntimeException.class);
-                    Throwables.throwIfInstanceOf(t, TException.class);
-                    throw new RuntimeException(t);
+                Exception interrupted = getInterruptionCause(t);
+                if (interrupted != null) {
+                    throw newInternalInterruptedException(interrupted, "remote invocation for model " + modelId);
                 }
                 logger.error("Remote invocation failed for model " + modelId, t);
                 return true;
@@ -4152,7 +4183,7 @@ public abstract class ModelMesh extends ThriftService
             }
             Throwables.throwIfInstanceOf(t, Error.class);
             Throwables.throwIfInstanceOf(t, TException.class); // other app-defined exceptions or ModelNotFoundException
-            throw new IllegalStateException(e); // should not happen
+            throw new IllegalStateException(t); // should not happen
         }
     }
 
@@ -4407,7 +4438,7 @@ public abstract class ModelMesh extends ThriftService
                     // runtime unexpectedly reporting model not found - update
                     // cache and registry accordingly
                     deregisterModelAsync(ce.modelId, 0L, ce.loadTimestamp, ce.loadCompleteTimestamp);
-                    ce.remove(false, CacheEntry.ALREADY_UNLOADED);
+                    ce.remove(true);
                     logger.warn("ModelRuntime in instance " + instanceId + " returned unexpected NOT_FOUND for model "
                                 + ce.modelId + "; purging from local cache and registration");
                     te = new ModelNotHereException(instanceId, ce.modelId);
@@ -4426,7 +4457,8 @@ public abstract class ModelMesh extends ThriftService
             long tookNanos = nanoTime() - beforeNanos;
             ce.afterInvoke(weight, tookNanos);
             if (code != null && metrics.isEnabled()) {
-                metrics.logApplyMethodTookNanosMetric(false, getRequestMethodName(method, args), tookNanos, code);
+                metrics.logRequestMetrics(false, getRequestMethodName(method, args),
+                        tookNanos, code, -1, -1);
             }
         }
     }
@@ -4499,14 +4531,15 @@ public abstract class ModelMesh extends ThriftService
     }
 
     // check if model load failures have breached the maximum allowed limit
-    private static void checkLoadFailureCount(String modelId, ModelRecord mr, ModelLoadException loadFailureSeen)
+    private void checkLoadFailureCount(ModelRecord mr, ModelLoadException loadFailureSeen)
             throws ModelLoadException {
         Map<String, Long> failedInInstances = mr.getLoadFailedInstanceIds();
         if (!failedInInstances.isEmpty()) {
             int count = 0;
+            final long expiryCutoffTime = currentTimeMillis() - IN_USE_LOAD_FAILURE_EXPIRY_MS;
             for (Long failTime : failedInInstances.values()) {
-                if (failTime > LOAD_FAILURE_EXPIRY_MS) {
-                    count++;
+                if (failTime > expiryCutoffTime) {
+                    count++; // not yet expired
                 }
                 if (count >= MAX_LOAD_FAILURES) {
                     if (loadFailureSeen != null) {
@@ -4634,6 +4667,11 @@ public abstract class ModelMesh extends ThriftService
         boolean isExcluded(String instanceId) {
             return contains(instanceId) || loaded.contains(instanceId) || failed.contains(instanceId)
                     || (explicit != null && explicit.contains(instanceId));
+        }
+
+        @Override
+        public String toString() {
+            return "LTF" + super.toString() + "[l=" + loaded + ", f=" + failed + ", e=" + explicit + "]";
         }
     }
 
@@ -4957,6 +4995,7 @@ public abstract class ModelMesh extends ThriftService
                     break; // success
                 }
 
+                logger.info("Encountered existing cache entry while loading model " + modelId);
                 synchronized (existCe) {
                     // A cache entry was already there - most likely that another thread
                     // in this instance is also loading this model (in this same method).
@@ -4972,6 +5011,7 @@ public abstract class ModelMesh extends ThriftService
                     if (latestMr == null) {
                         mrh[0] = null;
                         existCe.remove();
+                        logger.info("Existing cache entry for model " + modelId + " now gone");
                         return INSTANCES_CHANGED; // ModelNotFoundException will be thrown
                     }
 
@@ -4981,6 +5021,7 @@ public abstract class ModelMesh extends ThriftService
                             || !Objects.equals(latestMr.getLoadFailedInstanceIds(),
                                 mr.getLoadFailedInstanceIds())) {
                             // model registrations changed, re-start main loop
+                            logger.info("Registrations changed for " + modelId + ", will reevaluate");
                             return INSTANCES_CHANGED;
                         }
                         mr = latestMr;
@@ -4993,6 +5034,7 @@ public abstract class ModelMesh extends ThriftService
                         // Odd situation, similar to janitor logic for when a local
                         // cache entry is found without corresponding model record entry,
                         // we just "recycle" the already-loading/loaded one
+                        logger.info("Recycling existing entry for " + modelId + "(state=" + ceStateString(stateNow) + ")");
                         ce = existCe;
                         break;
                     }
@@ -5003,15 +5045,20 @@ public abstract class ModelMesh extends ThriftService
                         if (existCe.isFailed()) {
                             assert stateNow == CacheEntry.FAILED;
                             latestMr = handleUnexpectedFailedCacheEntry(existCe, mr);
-                            if (latestMr != mr) {
-                                mrh[0] = mr = latestMr;
-                                return INSTANCES_CHANGED;
+                            mrh[0] = latestMr;
+                            if (!existCe.isRemoved()) {
+                                if (latestMr != mr) {
+                                    return INSTANCES_CHANGED;
+                                }
+                                logger.info("Unexpected failed cache entry for model " + modelId
+                                        + ", treating as load failure");
+                                return existCe;
                             }
-                            mrh[0] = mr = latestMr;
-                            return existCe;
+                            // else continue to loop now that the entry has been removed
+                        } else {
+                            // We'll continue to loop in this case for now
+                            assert stateNow == CacheEntry.NEW;
                         }
-                        // We'll continue to loop in this case for now
-                        assert stateNow == CacheEntry.NEW;
                     }
 
                     existCe = null;
@@ -5188,33 +5235,40 @@ public abstract class ModelMesh extends ThriftService
         if (failure == null) {
             return mr; // safeguard timeout case (didn't see load fail but timed out waiting for it)
         }
-        if (failure instanceof ModelLoadException
-            && ((ModelLoadException) failure).getTimeout() == KVSTORE_LOAD_FAILURE) {
-            long failureAge = currentTimeMillis() - ce.loadCompleteTimestamp;
-            if (failureAge > 30_000 && failureAge > 30_000
-                    + ThreadLocalRandom.current().nextLong(30_000)) { // Randomize to avoid thunder
-                ModelRecord newMr = registry.get(ce.modelId);
-                if (newMr == null ? mr != null : (mr == null || newMr.getVersion() == mr.getVersion())) {
-                    // First replace the entry with a later-expiring one to block concurrent attempts
-                    CacheEntry<?> replacement = new CacheEntry<>(ce);
-                    if (runtimeCache.replaceQuietly(ce.modelId, ce, replacement)) {
-                        ce.remove();
-                        ce = replacement;
+        if (!(failure instanceof ModelLoadException)
+            || ((ModelLoadException) failure).getTimeout() != KVSTORE_LOAD_FAILURE) {
+            // We assume that this is an expired entry yet to be cleaned up
+            if (ce.remove()) {
+                logger.info("Removed residual failed cache entry for model " + ce.modelId);
+            }
+            return mr;
+        }
+
+        long failureAge = currentTimeMillis() - ce.loadCompleteTimestamp;
+        if (failureAge > 30_000 && failureAge > 30_000
+                + ThreadLocalRandom.current().nextLong(30_000)) { // Randomize to avoid thunder
+
+            ModelRecord newMr = registry.get(ce.modelId);
+            if (newMr == null ? mr == null : (mr != null && newMr.getVersion() == mr.getVersion())) {
+                // First replace the entry with a later-expiring one to block concurrent attempts
+                CacheEntry<?> replacement = new CacheEntry<>(ce);
+                if (runtimeCache.replaceQuietly(ce.modelId, ce, replacement)) {
+                    ce.remove();
+                    ce = replacement;
+                    try {
                         // this might throw if there are still KV store issues
-                        try {
-                            newMr = registry.getStrong(ce.modelId);
-                            if (ce.remove()) {
-                                logger.info("Removed kv-store failure cache entry for model " + ce.modelId);
-                            }
-                        } catch (Exception e) {
-                            // Cannot verify / still KV store problems
-                            logger.warn("Failed to retrieve model record after kv-store failure entry expiry"
-                                        + " for model " + ce.modelId);
+                        newMr = registry.getStrong(ce.modelId);
+                        if (ce.remove()) {
+                            logger.info("Removed kv-store failure cache entry for model " + ce.modelId);
                         }
+                    } catch (Exception e) {
+                        // Cannot verify / still KV store problems
+                        logger.warn("Failed to retrieve model record after kv-store failure entry expiry"
+                                + " for model " + ce.modelId);
                     }
                 }
-                return newMr;
             }
+            return newMr;
         }
         if (mr != null) {
             // Allow failure to propagate (e.g. to invokeLocalModel() after load attempt)
@@ -5277,11 +5331,20 @@ public abstract class ModelMesh extends ThriftService
                 long oldest = runtimeCache.oldestTime();
                 long cap = runtimeCache.capacity(), used = runtimeCache.weightedSize();
                 int count = runtimeCache.size(); //TODO maybe don't get every time
+                int unloadBufferWeight = -1, totalUnloadingWeight = -1;
+                long totalCacheOccupancy = -1;
                 if (unloadManager != null) {
+                    runtimeCache.getEvictionLock().lock();
+                    try {
+                        unloadBufferWeight = unloadManager.getUnloadBufferWeight();
+                        totalUnloadingWeight = unloadManager.getTotalUnloadingWeight();
+                        totalCacheOccupancy = unloadManager.getTotalModelCacheOccupancy();
+                    } finally {
+                        runtimeCache.getEvictionLock().unlock();;
+                    }
                     // remove unloading buffer weight from published values
-                    int weight = unloadManager.getUnloadBufferWeight();
-                    cap -= weight;
-                    used -= weight;
+                    cap -= unloadBufferWeight;
+                    used -= unloadBufferWeight;
                     count--;
                 }
                 if (oldest == -1L) {
@@ -5357,7 +5420,13 @@ public abstract class ModelMesh extends ThriftService
                     InstanceRecord existRec = instanceInfo.conditionalSetAndGet(instanceId, curRec, sessionId);
                     if (existRec == curRec) {
                         curRec.setActionableUpdate();
-                        logger.info("Published new instance record: " + curRec);
+                        String message = "Published new instance record: " + curRec;
+                        if (unloadBufferWeight != -1) {
+                            // Also log some internal values to help identify cache accounting anomalies
+                            message += ", UBW=" + unloadBufferWeight + ", TUW=" + totalUnloadingWeight
+                                    + ", TCO=" + totalCacheOccupancy;
+                        }
+                        logger.info(message);
                         lastPublished = now;
                         // our own record in clusterState will subsequently be
                         // updated via the instanceInfo listener.
@@ -5476,6 +5545,18 @@ public abstract class ModelMesh extends ThriftService
      */
     private Runnable rateTrackingTask() {
         return new Runnable() {
+            final int secondCopyMaxAgeIters = (int) ((SECOND_COPY_MAX_AGE_SECS * 1000L) / RATE_CHECK_INTERVAL_MS);
+            final int secondCopyMinAgeIters = (int) ((SECOND_COPY_MIN_AGE_SECS * 1000L) / RATE_CHECK_INTERVAL_MS);
+
+            // Minimum LRU when cache is close to full for permitting redundant model copies.
+            // This aims to avoid flip-flopping by ensuring that the scale-down lastUsed cutoff
+            // (10% of LRU) is at least 3x the SECOND_COPY_MAX_AGE_SECS scale-up threshold.
+            // Impose an absolute minimum of 6 hours.
+            final int secondCopyLruThresholdMillis = Math.max(SECOND_COPY_MAX_AGE_SECS * 3 * 10 * 1000, 6 * 3600_000);
+
+            // this is incremented each iteration (~ every RATE_CHECK_INTERVAL_MS)
+            int iterationCounter;
+
             // applies only to time-tracking mode, updated after each non-empty iteration
             double averageModelParallelism = 1.0;
 
@@ -5484,8 +5565,8 @@ public abstract class ModelMesh extends ThriftService
                 Thread curThread = Thread.currentThread();
                 String threadNameBefore = setThreadName(curThread, "rate-track-task");
                 try {
-                    long lastTime = lastCheckTime, now = currentTimeMillis();
-                    long timeDelta = now - lastTime; // should be ~= RATE_CHECK_INTERVAL_MS
+                    final long lastTime = lastCheckTime, now = currentTimeMillis();
+                    final long timeDelta = now - lastTime; // should be ~= RATE_CHECK_INTERVAL_MS
 
                     // skip if too soon - i think this can happen if task executions
                     // get backed up in the taskPool
@@ -5493,133 +5574,184 @@ public abstract class ModelMesh extends ThriftService
                         return;
                     }
 
-                    int instCount = clusterStats.instanceCount;
-                    if (instCount <= 2) {
-                        return; // can't scale beyond 2 copies regardless
-                    }
+                    // Determine the upper and lower bounds (inclusive) in terms of
+                    // iteration number between which a prior use of a single-copy model
+                    // will trigger a second copy to be loaded.
+                    final int lower = iterationCounter - secondCopyMaxAgeIters;
+                    final int upper = iterationCounter - secondCopyMinAgeIters;
 
-                    final long before = logger.isDebugEnabled() ? nanoTime() : 0L;
+                    try {
+                        int instCount = clusterStats.instanceCount;
+                        if (instCount < 2) {
+                            return; // can't scale if there are no other instances
+                        }
 
-                    Map<String, CacheEntry<?>> usedSinceLastRun = runtimeCache.descendingMapWithCutoff(lastTime);
-                    if (unloadManager != null) {
-                        unloadManager.removeUnloadBufferEntry(usedSinceLastRun);
-                    }
-                    if (usedSinceLastRun.isEmpty()) {
-                        // no invocations since last check
-                        lastCheckTime = now;
-                        return;
-                    }
+                        final long before = logger.isDebugEnabled() ? nanoTime() : 0L;
 
-                    // last-used timestamp to assign to newly trigger copy loads.
-                    // Set to 20sec in the *future* so that the logic in CacheMissForwardingLB
-                    // will have less placement tolerance w.r.t. how loaded the instances are
-                    final long newCopiesTimestamp = now + 20_000L;
+                        Map<String, CacheEntry<?>> usedSinceLastRun = runtimeCache.descendingMapWithCutoff(lastTime);
+                        if (unloadManager != null) {
+                            unloadManager.removeUnloadBufferEntry(usedSinceLastRun);
+                        }
+                        if (usedSinceLastRun.isEmpty()) {
+                            return; // no invocations since last check
+                        }
 
-                    boolean latencyBased = limitModelConcurrency;
-                    int scaleUpRpms = 0, heavyRpms = 0;
-                    if (!latencyBased) {
-                        scaleUpRpms = scaleUpRpmThreshold;
-                        heavyRpms = (scaleUpRpms * 3) / 4;
-                    }
-                    String modelId = null;
-                    Set<String> excludeSet = null; // instances to exclude because they are already highly loaded
-                    int modelParallelismSum = 0;
-                    for (Entry<String, CacheEntry<?>> ent : usedSinceLastRun.entrySet()) {
-                        try {
-                            modelId = ent.getKey(); // used in catch block
-                            CacheEntry<?> ce = ent.getValue();
-                            int suitableInstCount = instCount;
-                            if (typeConstraints != null) {
-                                // Check if this model type is constrained to a subset of instances
-                                // and skip if that subset comprises only one instance (us)
-                                ClusterStats cs = typeConstraints.getTypeSetStats(ce.modelInfo.serviceType);
-                                if (cs != null) {
-                                    suitableInstCount = cs.instanceCount;
+                        // last-used timestamp to assign to newly triggered copy loads.
+                        // Set to 20sec in the *future* so that the logic in CacheMissForwardingLB
+                        // will have less placement tolerance w.r.t. how loaded the instances are
+                        final long newCopiesTimestamp = now + 20_000L;
+
+                        boolean latencyBased = limitModelConcurrency;
+                        int scaleUpRpms = 0, heavyRpms = 0;
+                        if (!latencyBased) {
+                            scaleUpRpms = scaleUpRpmThreshold;
+                            heavyRpms = (scaleUpRpms * 3) / 4;
+                        }
+                        String modelId = null;
+                        Set<String> excludeSet = null; // instances to exclude because they are already highly loaded
+                        int modelParallelismSum = 0;
+                        for (Entry<String, CacheEntry<?>> ent : usedSinceLastRun.entrySet()) {
+                            try {
+                                modelId = ent.getKey(); // used in catch block
+                                CacheEntry<?> ce = ent.getValue();
+                                final long count = ce.getAndResetIntervalCount(); // Always reset
+                                ClusterStats clusterStats = typeSetStats(ce.modelInfo.serviceType);
+                                int suitableInstCount = instCount;
+                                if (typeConstraints != null) {
+                                    // Check if this model type is constrained to a subset of instances
+                                    // and skip if that subset comprises only one instance (us)
+                                    suitableInstCount = clusterStats.instanceCount;
                                     if (suitableInstCount < 2) {
                                         continue;
                                     }
                                 }
-                            }
-                            long count = ce.getAndResetIntervalCount();
-                            if (latencyBased) {
-                                MaxConcCacheEntry<?> mcce = (MaxConcCacheEntry<?>) ce;
-                                scaleUpRpms = mcce.getRpmScaleThreshold(true);
-                                heavyRpms = (scaleUpRpms * 3) / 4;
-                                modelParallelismSum += mcce.maxConc;
-                            }
-                            int rpm = (int) ((count * 60_000L) / timeDelta);
-                            //System.out.println("DEBUG: rateTrack "+modelId+" threshold="+scaleUpRpms+" current="+rpm);
-                            if (rpm > heavyRpms) ce.setLastHeavyTime(now);
-                            //TODO *maybe* tweak this more based on cluster state (other rpms)
-                            if (rpm < scaleUpRpms) continue; // load not high enough
-                            ModelRecord mr = registry.get(modelId);
-                            if (mr == null) continue; // not found in registry (not expected)
-                            // note, it's not possible for inst to be in both loaded + failed lists
-                            int loadedCount = mr.getInstanceIds().size();
-                            if (loadedCount < 2) continue; // for < 2 copies, load is triggered by other means
-                            int failedCount = mr.getLoadFailedInstanceIds().size();
 
-                            int candidateInstCount = suitableInstCount - (loadedCount + failedCount);
-                            if (candidateInstCount <= 0) continue; // no space to load new one
+                                if (latencyBased) {
+                                    MaxConcCacheEntry<?> mcce = (MaxConcCacheEntry<?>) ce;
+                                    scaleUpRpms = mcce.getRpmScaleThreshold(true);
+                                    heavyRpms = (scaleUpRpms * 3) / 4;
+                                    modelParallelismSum += mcce.maxConc;
+                                }
+                                int rpm = (int) ((count * 60_000L) / timeDelta);
+                                //System.out.println("DEBUG: rateTrack "+modelId+" threshold="+scaleUpRpms+" current="+rpm);
+                                if (rpm > heavyRpms) ce.setLastHeavyTime(now);
 
-                            // skip if a prior load was too recent to gauge new load requirement
-                            // - the measured req load won't fully take into account their serving contribution.
-                            // (unless it was our load, in which case it shouldn't be an overestimate)
-                            long recentLoadCutoff = now - (timeDelta + RATE_CHECK_INTERVAL_MS
-                                    + 2L * loadingTimeStats(mr.getType()).assumeCompletedAfterMillis());
-                            if (loadedSince(mr, recentLoadCutoff, instanceId)) continue;
+                                ModelRecord mr = registry.get(modelId);
+                                if (mr == null) continue; // not found in registry (not expected)
+                                // note, it's not possible for inst to be in both loaded + failed lists
+                                int loadedCount = mr.getInstanceIds().size();
+                                if (loadedCount == 0) {
+                                    continue; // unexpected - likely mid unload
+                                }
+                                int failedCount = mr.getLoadFailedInstanceIds().size();
 
-                            Set<String> ourExcludeSet;
-                            if (excludeSet == null) {
-                                excludeSet = getExcludeSet(); // (construct lazily)
-                            }
-                            int excludedCount = excludeSet.size();
-                            if (excludedCount != 0) {
-                                for (String iid : excludeSet) {
-                                    if (!mr.getInstanceIds().containsKey(iid)
-                                        && !mr.loadFailedInInstance(iid)) {
-                                        candidateInstCount--;
+                                int candidateInstCount = suitableInstCount - (loadedCount + failedCount);
+                                if (candidateInstCount <= 0) continue; // no space to load new one
+
+                                // For 1->2 copies, scale-up can also be triggered by a pattern of recent usage
+                                // See explanation of CacheEntry#usageSlices
+                                if (loadedCount == 1) {
+                                    // assert mr.getInstanceIds().containsKey(instanceId);
+
+                                    int i1 = ce.earlierUseIteration, i2 = ce.lastUsedIteration;
+                                    // invariants: lower < upper, i1 <= i2
+                                    if (logger.isDebugEnabled()) {
+                                        logger.debug("Second copy trigger evaluation for model " + modelId
+                                            + ": target range [" + lower + ", " + upper + "], I1="
+                                                + i1 + ", I2=" + i2 + ", curIteration=" + iterationCounter);
+                                    }
+                                    boolean i1inRange = false, i2inRange = false;
+                                    if (i2 >= lower && i1 <= upper) {
+                                        i1inRange = i1 >= lower;
+                                        i2inRange = i2 <= upper;
+                                    }
+                                    if (i2inRange || !i1inRange) {
+                                        ce.earlierUseIteration = i2;
+                                    }
+                                    ce.lastUsedIteration = iterationCounter;
+
+                                    if (i1inRange || i2inRange) {
+                                        // Model was used within the target range [MIN_AGE, MAX_AGE] iterations ago
+                                        // so trigger loading of a second copy
+
+                                        // Don't do it if > 90% full and cache is younger than secondCopyLruThresholdMillis
+                                        if ((10 * clusterStats.totalFree) / clusterStats.totalCapacity >= 1
+                                                || (now - clusterStats.globalLru) > secondCopyLruThresholdMillis) {
+                                            logger.info("Attempting to add second copy of model " + modelId
+                                                    + " in another instance since \"regular\" usage was detected");
+                                            ensureLoadedInternalAsync(modelId, lastTime, ce.getWeight(), excludeThisInstance, 0);
+                                            continue;
+                                        }
                                     }
                                 }
-                                candidateInstCount -= excludedCount;
-                                if (candidateInstCount <= 0) {
-                                    continue; // no *suitable* candidates
+
+                                //TODO *maybe* tweak this more based on cluster state (other rpms)
+                                if (rpm < scaleUpRpms) continue; // load not high enough
+
+                                // skip if a prior load was too recent to gauge new load requirement
+                                // - the measured req load won't fully take into account their serving contribution.
+                                // (unless it was our load, in which case it shouldn't be an overestimate)
+                                long recentLoadCutoff = now - (timeDelta + RATE_CHECK_INTERVAL_MS
+                                        + 2L * loadingTimeStats(mr.getType()).assumeCompletedAfterMillis());
+                                if (loadedSince(mr, recentLoadCutoff, instanceId)) continue;
+
+                                Set<String> ourExcludeSet;
+                                if (excludeSet == null) {
+                                    excludeSet = getExcludeSet(); // (construct lazily)
                                 }
-                                ourExcludeSet = Sets.union(excludeSet, mr.getInstanceIds().keySet());
-                            } else {
-                                ourExcludeSet = mr.getInstanceIds().keySet();
-                            }
+                                int excludedCount = excludeSet.size();
+                                if (excludedCount != 0) {
+                                    for (String iid : excludeSet) {
+                                        if (!mr.getInstanceIds().containsKey(iid)
+                                                && !mr.loadFailedInInstance(iid)) {
+                                            candidateInstCount--;
+                                        }
+                                    }
+                                    candidateInstCount -= excludedCount;
+                                    if (candidateInstCount <= 0) {
+                                        continue; // no *suitable* candidates
+                                    }
+                                    ourExcludeSet = Sets.union(excludeSet, mr.getInstanceIds().keySet());
+                                } else {
+                                    ourExcludeSet = mr.getInstanceIds().keySet();
+                                }
 
-                            int copiesToLoad = Math.min(rpm / scaleUpRpms, candidateInstCount);
-                            // cap # copies to load in one go at max(2, 33% of cluster size)
-                            if (copiesToLoad > 2) {
-                                copiesToLoad = Math.min(copiesToLoad, suitableInstCount / 3);
-                            }
+                                int copiesToLoad = Math.min(rpm / scaleUpRpms, candidateInstCount);
+                                // cap # copies to load in one go at max(2, 33% of cluster size)
+                                if (copiesToLoad > 2) {
+                                    copiesToLoad = Math.min(copiesToLoad, suitableInstCount / 3);
+                                }
 
-                            List<String> toExclude = new ArrayList<>(ourExcludeSet);
-                            logger.info("Triggering scale-up of model " + modelId + " by " + copiesToLoad
+                                List<String> toExclude = new ArrayList<>(ourExcludeSet);
+                                logger.info("Triggering scale-up of model " + modelId + " by " + copiesToLoad
                                         + ", from " + loadedCount + " -> " + (loadedCount + copiesToLoad) + " copies"
                                         + (failedCount > 0 ? " (also has " + failedCount + " failure records)" : "")
                                         + ". RPM over last " + timeDelta + "ms was " + rpm
                                         + ", current threshold is " + scaleUpRpms
                                         + (excludedCount > 0 ? " (" + excludedCount + " instances excluded)" : ""));
-                            ensureLoadedInternalAsync(modelId, newCopiesTimestamp, ce.getWeight(), toExclude,
-                                    copiesToLoad - 1);
-                        } catch (RuntimeException e) {
-                            // shouldn't happen - but just in case continue loop
-                            logger.error("Unexpected runtime exception while processing request rate for model"
-                                         + (modelId != null ? " " + modelId : ""), e);
-                        } finally {
-                            modelId = null;
+                                ensureLoadedInternalAsync(modelId, newCopiesTimestamp, ce.getWeight(), toExclude,
+                                        copiesToLoad - 1);
+                            } catch (RuntimeException e) {
+                                // shouldn't happen - but just in case continue loop
+                                logger.error("Unexpected runtime exception while processing request rate for model"
+                                        + (modelId != null ? " " + modelId : ""), e);
+                            } finally {
+                                modelId = null;
+                            }
                         }
-                    }
-                    // only set this if we've reset the model counts
-                    lastCheckTime = now;
-                    if (latencyBased) averageModelParallelism = Math.max(1.0,
-                            ((double) modelParallelismSum) / usedSinceLastRun.size());
-                    if (before != 0L) {
-                        logger.debug("rateTrackingTask took " + msSince(before) + "ms, processed "
-                                     + usedSinceLastRun.size() + " models");
+                        if (latencyBased) {
+                            averageModelParallelism = Math.max(1.0,
+                                    ((double) modelParallelismSum) / usedSinceLastRun.size());
+                        }
+                        if (before != 0L) {
+                            logger.debug("rateTrackingTask took " + msSince(before) + "ms, processed "
+                                    + usedSinceLastRun.size() + " models");
+                        }
+
+                    } finally {
+                        // only set this if we've reset the model counts
+                        lastCheckTime = now;
+                        iterationCounter++;
                     }
                 } finally {
                     curThread.setName(threadNameBefore);
@@ -5710,10 +5842,23 @@ public abstract class ModelMesh extends ThriftService
                                                 + " lastUsed is " + lastUsed + " > " + lastLastUsed);
                                 }
                                 lastLastUsed = lastUsed;
+
+                                ModelRecord mr = registry.get(modelId);
+
+                                if (lastUsed == Long.MAX_VALUE) {
+                                    // Cache entries here should not have a Long.MAX_VALUE lastUsed value but this has been observed
+                                    // in some environments. Repair/log here so that the entry is not pinned in the cache.
+                                    if (runtimeCache.forceSetLastUsedTime(modelId, now - (LASTUSED_AGE_ON_ADD_MS * 3L))) {
+                                        logger.warn("Force-updated unexpected Long.MAX_VALUE lastUsed time in cache for model " + modelId);
+                                        // Also update in registry if needed
+                                        repairLastUsedTimeIfNeeded(modelId, mr);
+                                    }
+                                    return;
+                                }
+
                                 // skip if new or recently used
                                 final boolean newOrUsedRecently = now - lastUsed < LOCAL_JANITOR_FREQ_SECS * 2000L
                                                                                    + loadTimeoutMs;
-                                ModelRecord mr = registry.get(modelId);
                                 if (newOrUsedRecently) {
                                     if (mr != null) {
                                         updateLastUsedTimeInRegistryIfStale(modelId, mr, lastUsed);
@@ -5749,7 +5894,7 @@ public abstract class ModelMesh extends ThriftService
                                     // remove it from the local cache.
                                     if (mr == null || ce.state < CacheEntry.LOADING || ce.state > CacheEntry.ACTIVE // includes failed
                                         || ce.unloadAttemptedRecently()) {
-                                        if (ce.remove(false, lastUsed)) {
+                                        if (ce.remove()) {
                                             logger.info("Janitor removed" + (failed ? " *failed*" : "") + " model "
                                                         + modelId + " from cache because not present in registry");
                                             cacheChanged = true;
@@ -5817,10 +5962,22 @@ public abstract class ModelMesh extends ThriftService
                                 if (ce == null) {
                                     ce = runtimeCache.getQuietly(modelId);
                                 }
-                                long lastUsed = -1L;
+                                long lastUsed = -2L;
                                 boolean remLoaded = loaded && (ce == null || ce.isFailed());
-                                boolean remFailed = failedTime != null
-                                        && ((ce != null && !ce.isFailed()) || now - failedTime > LOAD_FAILURE_EXPIRY_MS);
+                                boolean remFailed = false;
+                                if (failedTime != null) {
+                                    if (ce != null && !ce.isFailed()) {
+                                        remFailed = true;
+                                    } else {
+                                        lastUsed = ce != null ? runtimeCache.getLastUsedTime(modelId) : -1L;
+                                        // Use shorter expiry age if model was used in last 3 minutes
+                                        final long expiryAge = (lastUsed > 0 && (now - lastUsed) < SHORT_EXPIRY_RECENT_USE_TIME_MS)
+                                                ? IN_USE_LOAD_FAILURE_EXPIRY_MS : LOAD_FAILURE_EXPIRY_MS;
+                                        if (now - failedTime > expiryAge) {
+                                            remFailed = true;
+                                        }
+                                    }
+                                }
                                 if (remLoaded || remFailed) {
                                     if (shuttingDown) {
                                         return;
@@ -5834,7 +5991,9 @@ public abstract class ModelMesh extends ThriftService
                                         mr.removeLoadFailure(instanceId);
                                     }
                                     if (ce != null) {
-                                        lastUsed = runtimeCache.getLastUsedTime(modelId);
+                                        if (lastUsed == -2) {
+                                            lastUsed = runtimeCache.getLastUsedTime(modelId);
+                                        }
                                         if (lastUsed > 0L) {
                                             mr.updateLastUsed(lastUsed);
                                         }
@@ -5854,7 +6013,10 @@ public abstract class ModelMesh extends ThriftService
                                     }
                                 }
                                 j++;
-                                if (loaded && !remLoaded) {
+                                if (remFailed && ce != null && ce.isFailed()) {
+                                    // Also remove expired failure records from local cache
+                                    ce.remove();
+                                } else if (loaded && !remLoaded) {
                                     if (lastUsed <= 0L) {
                                         lastUsed = runtimeCache.getLastUsedTime(modelId);
                                     }
@@ -5888,7 +6050,7 @@ public abstract class ModelMesh extends ThriftService
                                 modelId = (String) ent.getKey()[0];
                                 CacheEntry<?> ce = (CacheEntry<?>) ent.getKey()[2];
                                 int weight = ce.getWeight();
-                                boolean removed = addOrRemoveModelCopies(modelId, (ModelRecord) ent.getKey()[1], ce,
+                                boolean removed = removeModelCopies(modelId, (ModelRecord) ent.getKey()[1], ce,
                                         ent.getValue(), now,
                                         // allow removing our copy if none have been scaled down yet
                                         // or we're in the removal weight allowance
@@ -5899,7 +6061,7 @@ public abstract class ModelMesh extends ThriftService
                                     weightRemoved += weight;
                                 }
                             } catch (Exception e) {
-                                logger.error("Janitor exception while scaling copies"
+                                logger.error("Janitor exception while scaling down copies"
                                              + (modelId != null ? " for model " + modelId : ""), e);
                             }
                         }
@@ -5929,6 +6091,10 @@ public abstract class ModelMesh extends ThriftService
             // ModelRecord instance should not be used after calling this meth (might be stale)
             private void updateLastUsedTimeInRegistryIfStale(String modelId, ModelRecord mr, long lastUsed)
                     throws Exception {
+                if (lastUsed == Long.MAX_VALUE) {
+                    // This can be the case for certain failure placeholder records
+                    return;
+                }
                 // only attempt update of model record lastUsed time if it's more than
                 // minStaleAge out of date.
                 long recLastUsed = mr.getLastUsed();
@@ -5948,26 +6114,18 @@ public abstract class ModelMesh extends ThriftService
     }
 
     /*
-     * The logic in this method is invoked by the local janitor task, and "scales up"
-     * or "scales down" the number of loaded copies of a model (across multiple instances)
+     * The logic in this method is invoked by the local janitor task, and "scales down"
+     * "scales down" the number of loaded copies of a model (across multiple instances)
      * based on how recently it was used.
      *
-     * The scale-up here is *only* for moving from 1 to 2 copies, to "catch" any
-     * missed by the other triggers on the invoke model request path. Growing beyond 2
-     * copies is handled by the rateTrackingTask.
+     * The corresponding scale-up is handled by the rateTrackingTask.
      *
      */
-    private boolean addOrRemoveModelCopies(String modelId, ModelRecord mr, CacheEntry<?> ce, long lastUsed,
-            long nowMillis, boolean canRemove) {
+    private boolean removeModelCopies(String modelId, ModelRecord mr, CacheEntry<?> ce, long lastUsed,
+                                      long nowMillis, boolean canRemove) {
         if (lastUsed == 0L) {
             return false; // gone, nothing to do
         }
-
-        /*
-         * If we have the only copy of this model, determine if it should be scaled up to 2 copies.
-         */
-        boolean copyAdded = addSecondCopyIfNecessary(modelId, ce, mr.getInstanceIds(), lastUsed, nowMillis,
-                ce.getApproxTotalInvocationCount() == 0);
 
         int numInstances = mr.getInstanceIds().size();
 
@@ -5989,7 +6147,7 @@ public abstract class ModelMesh extends ThriftService
          * (in any instance) into account ensures that multiple instances won't
          * make the same scale-down decision for the same model at the same time.
          */
-        if (!canRemove || copyAdded || numInstances < 2) {
+        if (!canRemove || numInstances < 2) {
             return false;
         }
 
@@ -6018,9 +6176,9 @@ public abstract class ModelMesh extends ThriftService
 
         if (numInstances == 2) {
             // if loaded in 2 places, reduce if old enough
-            long lastHeavyTime = ce.getLastHeavyTime();
-            long scaleDownAge = (nowMillis - stats.globalLru) / 5L; // 20% of cache "age"
-            if (lastHeavyTime == 0 || (nowMillis - lastHeavyTime) < (nowMillis - stats.globalLru) / 3L) {
+            long lastHeavyTime = ce.getLastHeavyTime(), cacheAge = nowMillis - stats.globalLru;
+            long scaleDownAge = cacheAge / 10L; // 10% of cache "age"
+            if (lastHeavyTime == 0 || (nowMillis - lastHeavyTime) < cacheAge / 5L) {
                 // unless model has recent "heavy" usage, cap scale-down age at 16 hours
                 scaleDownAge = Math.min(SECOND_COPY_REMOVE_MAX_AGE_MS, scaleDownAge);
             }
@@ -6136,7 +6294,7 @@ public abstract class ModelMesh extends ThriftService
                 if (registry.conditionalSet(modelId, mr)) {
                     logger.info("Removing copy of model " + modelId + " from instance " + instanceId
                                 + " due to scale-down. Model now has " + mr.getInstanceIds().size() + " loaded copies");
-                    ce.remove(false, lastUsed);
+                    ce.remove();
                 }
                 // else no big deal, we'll try again next time around
             } catch (Exception e) {
@@ -6147,73 +6305,12 @@ public abstract class ModelMesh extends ThriftService
         return true;
     }
 
-    // returns true if the add was attempted
-    protected boolean addSecondCopyIfNecessary(String modelId, CacheEntry<?> ce, Map<String, Long> loadedInstances,
-            long lastUsed, long nowMillis, boolean unused) {
-        if (lastUsed < 0) {
-            return false;
-        }
-        long age = lastUsed == 0L ? 0L : nowMillis - lastUsed;
-        if (!modelCopyShouldBeAdded(loadedInstances, age, nowMillis, unused, ce.modelType())) {
-            return false;
-        }
-        addSecondCopyAsync(modelId, lastUsed, nowMillis, ce);
-        return true;
-    }
-
-    /**
-     * @param loadedInstances
-     * @param age
-     * @param now
-     * @param unused          indicates whether this model has *really* been used yet since being
-     *                        loaded in this instance (models can be added/loaded with a recent lastUsed
-     *                        time for cache ordering purposes, without actually having yet been invoked)
-     * @return
-     */
-    protected boolean modelCopyShouldBeAdded(Map<String, Long> loadedInstances, long age, long now, boolean unused,
-            String modelType) {
-        int copiesLoaded = loadedInstances.size();
-        // don't do it if there's already more than one copy or last-used is before the threshold
-        if (copiesLoaded > 1) {
-            return false;
-        }
-        if (age >= SECOND_COPY_ADD_AGE_UNUSED_MS) {
-            // note the value below (12 hours) must be smaller than the 16-hour 2->1 scale-down
-            // cutoff in the janitor addOrRemoveModelCopies logic
-            if (unused || age > SECOND_COPY_ADD_AGE_USED_MS) {
-                return false;
-            }
-        }
-        // don't do it if the other copy only just started loading
-        if(copiesLoaded == 1 && (now - loadedInstances.values().iterator().next())
-                < Math.max(loadingTimeStats(modelType).mean() / 2, 2000L)) {
-            return false;
-        }
-
-        ClusterStats stats = typeSetStats(modelType);
-        // don't do it if there's nowhere to put a second copy
-        return stats.instanceCount > 1 &&
-               // don't do it if > 90% full and cache is younger than 3 hours
-               ((10 * stats.totalFree) / stats.totalCapacity >= 1
-                || (now - stats.globalLru) > (3 * 6 * SECOND_COPY_ADD_AGE_UNUSED_MS));
-    }
-
-    // ensure recently used models are loaded in two places
-    protected void addSecondCopyAsync(String modelId, long lastUsed, long nowMillis, CacheEntry<?> ce) {
-        if (ce.secondCopyTriggerDebounce(nowMillis)) {
-            long age = lastUsed == 0L ? 0L : nowMillis - lastUsed;
-            logger.info("Attempting to add second copy of model " + modelId + " in another instance since "
-                        + (age == 0 ? "it is in use" : "it was used " + age + "ms ago"));
-            ensureLoadedInternalAsync(modelId, lastUsed, ce.getWeight(), excludeThisInstance, 0);
-        }
-    }
-
     protected void ensureLoadedInternalAsync(String modelId, long lastUsed, int weight, List<String> toExclude,
             int chainedLoadCount) {
         // dispatch to another thread to actually invoke ensureLoaded
         taskPool.execute(() -> {
             try {
-                ensureLoadedInternal(modelId, lastUsed, weight, toExclude, chainedLoadCount);
+                ensureLoadedInternal(modelId, lastUsed, weight, toExclude, chainedLoadCount, false);
             } catch (Exception e) {
                 logger.warn("Error triggering/ensuring additional load of model " + modelId, e);
             }
@@ -6395,6 +6492,10 @@ public abstract class ModelMesh extends ThriftService
                                         }
                                         // else no pruning was done
                                     }
+
+                                    // Check for invalid lastUsed field value and repair if needed
+                                    repairLastUsedTimeIfNeeded(modelId, mr);
+
                                     // If we have room and this model is not loaded, add it to the list
                                     // to be loaded proactively
                                     if (proactiveLoadCandidates != null && insts.isEmpty() && failInsts.size() < 2
@@ -6409,8 +6510,8 @@ public abstract class ModelMesh extends ThriftService
                                 if (io.grpc.Status.fromThrowable(e).getCode() == Code.UNAVAILABLE) {
                                     if (++kvConnectionErrorCount >= 3) {
                                         logger.info("Skipping remaining models on this reaper iteration");
+                                        break;
                                     }
-                                    break;
                                 }
                             }
                         }
@@ -6441,7 +6542,7 @@ public abstract class ModelMesh extends ThriftService
                      */
                     void triggerProactiveLoadsForInstanceSubset(ClusterStats stats,
                             List<Entry<String, ModelRecord>> allCandidates,
-                            String[] excludeTypes) throws InterruptedException {
+                            ProhibitedTypeSet excludeTypes) throws InterruptedException {
                         // get free units
                         int freeSpaceProactiveLoadCount = 0, totalProactiveLoadCount = 0;
                         if (stats.totalCapacity > 0 && stats.totalFree > 0) {
@@ -6459,7 +6560,7 @@ public abstract class ModelMesh extends ThriftService
                             long spaceToFill = 0L;
                             for (Entry<String, InstanceRecord> ent : clusterState) {
                                 InstanceRecord ir = ent.getValue();
-                                if (excludeTypes != null && !Arrays.equals(excludeTypes, ir.prohibitedTypes)) {
+                                if (excludeTypes != null && !excludeTypes.equals(ir.prohibitedTypes)) {
                                     continue;
                                 }
                                 // skip instances with already significant loading queue
@@ -6490,8 +6591,7 @@ public abstract class ModelMesh extends ThriftService
                                 : stats.globalLru + Math.max(age(stats.globalLru) / 3L, 1_200_000L);
                         if (logger.isDebugEnabled()) {
                             logger.debug(excludeTypes == null ? "" :
-                                    ("PTS subset " + Arrays.toString(excludeTypes)
-                                            + " (" + stats.instanceCount + " instances):")
+                                    ("PTS subset " + excludeTypes + " (" + stats.instanceCount + " instances):")
                                     + " maxProactiveLoadCount=" + totalProactiveLoadCount
                                     + " >= freeSpaceProactiveLoadCount=" + freeSpaceProactiveLoadCount
                                     + "; proactiveLastUsedCutoff=" + (proactiveLastUsedCutoff == 0L ? "none"
@@ -6506,8 +6606,7 @@ public abstract class ModelMesh extends ThriftService
                                 continue;
                             }
                             ModelRecord mr = ent.getValue();
-                            if (excludeTypes != null
-                                && Arrays.binarySearch(excludeTypes, mr.getType()) >= 0) {
+                            if (excludeTypes != null && excludeTypes.contains(mr.getType())) {
                                 continue;
                             }
                             long lastUsed = mr.getLastUsed();
@@ -6531,8 +6630,7 @@ public abstract class ModelMesh extends ThriftService
                         // process list of models to be proactively loaded
                         logger.info("About to trigger proactive loading of " + toLoad.size() +
                                     " currently unloaded models" + (excludeTypes == null ? ""
-                                : " for instance subset with PTS" + Arrays.toString(excludeTypes)
-                                  + " and " + stats));
+                                : " for instance subset with " + excludeTypes + " and " + stats));
                         long beforeNanos = nanoTime();
                         int count = 0;
                         final Phaser phaser = new Phaser(1);
@@ -6553,12 +6651,7 @@ public abstract class ModelMesh extends ThriftService
                             allCandidates.set(modelToLoad.index, null); // null out loaded model
                             taskPool.execute(() -> {
                                 try {
-                                    ThreadContext.removeCurrentContext(); // ensure context is clear
-                                    // add flag to ensure we aren't specially favoured
-                                    // when placing the proactive loads
-                                    ThreadContext.addContextEntry(UNBALANCED_KEY, "true");
-                                    ensureLoaded(fModelId, timestamp, null, false, false);
-                                } catch (ModelNotFoundException mnfe) { // no problem, ignore
+                                    ensureLoadedInternal(fModelId, timestamp, 0, null, 0, false);
                                 } catch (Exception e) {
                                     logger.warn("Exception from proactive load of model " + fModelId, e);
                                 } finally {
@@ -6668,6 +6761,21 @@ public abstract class ModelMesh extends ThriftService
         }
     }
 
+    final void repairLastUsedTimeIfNeeded(String modelId, ModelRecord mr) throws Exception {
+        // Some ModelRecords records were observed in the registry with an invalid lastUsed
+        // time of Long.MAX_VALUE, effectively pinning them at the front of the cache and
+        // causing them to remain loaded even if not used.
+        // It's not clear whether the bug causing this has yet been fixed - for now we repair
+        // the entries and can monitor logs for the warning message below.
+        if (mr != null && mr.getLastUsed() == Long.MAX_VALUE) {
+            mr.setLastUsed(currentTimeMillis() - (LASTUSED_AGE_ON_ADD_MS * 3L));
+            if (registry.conditionalSet(modelId, mr)) {
+                logger.warn("Repaired Long.MAX_VALUE lastUsed time in registry for model " + modelId);
+            }
+            // Don't worry if this fails, will try again next time around
+        }
+    }
+
     private void logModelCountMetrics() {
         if (!metrics.isEnabled()) {
             return;
@@ -6722,7 +6830,7 @@ public abstract class ModelMesh extends ThriftService
      * regardless of whether it's already loaded in this instance.
      */
     protected StatusInfo ensureLoadedElsewhere(String modelId, long lastUsedTime, int weight) throws InternalException {
-        return ensureLoadedInternal(modelId, lastUsedTime, weight, excludeThisInstance, 0);
+        return ensureLoadedInternal(modelId, lastUsedTime, weight, excludeThisInstance, 0, false);
     }
 
     /*
@@ -6743,25 +6851,28 @@ public abstract class ModelMesh extends ThriftService
                 toExclude.add(instanceId);
             }
         }
-        return ensureLoadedInternal(modelId, lastUsedTime, weight, toExclude, 0);
+        return ensureLoadedInternal(modelId, lastUsedTime, weight, toExclude, 0, false);
     }
 
     protected StatusInfo ensureLoadedInternal(String modelId, long lastUsedTime, int weight, List<String> toExclude,
-            int chainedLoadCount) throws InternalException {
+            int chainedLoadCount, boolean sync) throws InternalException {
+        ThreadContext.removeCurrentContext(); // ensure context is clear
+        // inform other instances of the weight for more accurate initial sizing
+        if (weight > INSERTION_WEIGHT) {
+            ThreadContext.addContextEntry(KNOWN_SIZE_CXT_KEY, String.valueOf(weight));
+        }
+        if (chainedLoadCount > 0) {
+            ThreadContext.addContextEntry(CHAINED_LOAD_COUNT_KEY, String.valueOf(chainedLoadCount));
+        }
+        if (toExclude == null || !toExclude.contains(instanceId)) {
+            // add flag to ensure we aren't specially favoured
+            ThreadContext.addContextEntry(UNBALANCED_KEY, "true");
+        }
+        ThreadContext.addContextEntry(TAS_INTERNAL_CXT_KEY, INTERNAL_REQ);
+        // Set 3 second timeout or 10 minute "safeguard" if blocking
+        ThreadContext.setDeadlineAfter(sync ? 600L : 3L + chainedLoadCount, SECONDS);
         try {
-            ThreadContext.removeCurrentContext(); // ensure context is clear
-            // inform other instances of the weight for more accurate initial sizing
-            if (weight > INSERTION_WEIGHT) {
-                ThreadContext.addContextEntry(KNOWN_SIZE_CXT_KEY, String.valueOf(weight));
-            }
-            if (chainedLoadCount > 0) {
-                ThreadContext.addContextEntry(CHAINED_LOAD_COUNT_KEY, String.valueOf(chainedLoadCount));
-            }
-            if (toExclude == null || !toExclude.contains(instanceId)) {
-                // add flag to ensure we aren't specially favoured
-                ThreadContext.addContextEntry(UNBALANCED_KEY, "true");
-            }
-            return ensureLoaded(modelId, lastUsedTime, toExclude, false, true);
+            return ensureLoaded(modelId, lastUsedTime, toExclude, sync, true);
         } catch (ModelNotFoundException mnfe) {
             return SI_NOT_FOUND;
         }
@@ -6836,7 +6947,7 @@ public abstract class ModelMesh extends ThriftService
                             }
                             long lruTime = lruT != 0L ? lruT : runtimeCache.getLastUsedTime(modelId);
                             if (lruTime >= 0) {
-                                ce.remove(false, lruTime);
+                                ce.remove();
                             }
                             // deregister now if it's "safe" i.e. cache entry future was aborted
                             // and so can't yet be servicing any requests
@@ -6885,12 +6996,11 @@ public abstract class ModelMesh extends ThriftService
                             ListenableFuture<?> waiter = taskPool.submit(() -> {
                                 try {
                                     //TODO TBD poll or blocking approach
-                                    ThreadContext.removeCurrentContext(); // Clear context to ensure we don't load locally
                                     //TODO this currently won't wait for *additional* copies to finish loading if there
                                     // already other fully-loaded copies. We might want to tweak this to do so for models
                                     // which have been used within the last small window of time (e.g. ~3x expected loading time),
                                     // to ensure the remaining copies aren't temporarily over-burdened
-                                    StatusInfo status = ensureLoaded(modelId, lastUsed, excludeThis, true, false);
+                                    StatusInfo status = ensureLoadedInternal(modelId, lastUsed, 0, excludeThis, 0, true);
                                     if (status.getStatus() == Status.LOADING_FAILED) {
                                         logger.warn("Model failed to load elsewhere: " + modelId
                                                 + (status.getErrorMessages() != null ? (", "
@@ -6982,7 +7092,7 @@ public abstract class ModelMesh extends ThriftService
         try {
             loadingPool.awaitTermination(3, SECONDS);
         } catch (InterruptedException e) {
-            logger.warn("Interrupted while waiting for taskpool termination", e);
+            logger.warn("Interrupted while waiting for loadingpool termination", e);
             Thread.currentThread().interrupt();
         }
 
@@ -6996,7 +7106,6 @@ public abstract class ModelMesh extends ThriftService
             logger.warn("Interrupted while waiting for taskpool termination", e);
             Thread.currentThread().interrupt();
         }
-        evictionTaskThread.shutdown();
 
         // log empty instance metrics here since we're about to disappear
         metrics.logInstanceStats(new InstanceRecord());
@@ -7047,15 +7156,19 @@ public abstract class ModelMesh extends ThriftService
         return String.format("%.3fGiB", (float) bytes / (float) Gi);
     }
 
-    static boolean isInterruption(Throwable t) {
+    static Exception getInterruptionCause(Throwable t) {
         while (t != null) {
             if (t instanceof InterruptedException || t instanceof InterruptedIOException
-                || t instanceof ClosedByInterruptException) {
-                return true;
+                    || t instanceof ClosedByInterruptException) {
+                return (Exception) t;
             }
             t = t.getCause();
         }
-        return false;
+        return null;
+    }
+
+    static boolean isInterruption(Throwable t) {
+        return getInterruptionCause(t) != null;
     }
 
     static boolean isTimeout(Throwable t) {
@@ -7075,6 +7188,16 @@ public abstract class ModelMesh extends ThriftService
         if (cause != null) ie.initCause(cause);
         ie.setCauseStacktrace(Throwables.getStackTraceAsString(ie));
         logger.error(message != null ? message : "Unexpected exception", cause);
+        return ie;
+    }
+
+    protected static InternalException newInternalInterruptedException(Exception cause, String task) {
+        InternalException ie = new InternalException();
+        ie.setMessage("Request interrupted due to " + GrpcSupport.cancellationReason(Context.current())
+                + " while waiting for " + task);
+        if (cause != null) ie.initCause(cause);
+        ie.setCauseStacktrace(Throwables.getStackTraceAsString(ie));
+        logger.warn(ie.getMessage(), cause);
         return ie;
     }
 

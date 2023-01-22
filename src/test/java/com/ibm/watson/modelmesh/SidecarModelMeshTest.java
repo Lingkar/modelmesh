@@ -124,7 +124,7 @@ public class SidecarModelMeshTest extends SingleInstanceModelMeshTest {
     public void loadFailureTest() throws Exception {
         ManagedChannel channel = NettyChannelBuilder.forAddress("localhost", 8088)
                 .usePlaintext().build();
-        String modelId = "myModel";
+        String modelId = "myModel_" + getClass().getSimpleName();
         ModelMeshBlockingStub manageModels = ModelMeshGrpc.newBlockingStub(channel);
         try {
             String errorMessage = "load should fail with this error";
@@ -158,7 +158,7 @@ public class SidecarModelMeshTest extends SingleInstanceModelMeshTest {
         assertEquals(ModelStatus.LOADING_FAILED, statusInfo.getModelCopyInfos(0).getCopyStatus());
         assertFalse(Strings.isNullOrEmpty(statusInfo.getModelCopyInfos(0).getLocation()));
         long age = System.currentTimeMillis() - statusInfo.getModelCopyInfos(0).getTime();
-        assertTrue(age > 0L && age < 15000L, "time " + statusInfo.getModelCopyInfos(0).getTime()
+        assertTrue(age >= 0L && age < 15000L, "time " + statusInfo.getModelCopyInfos(0).getTime()
                                              + " age " + age + "ms");
     }
 
